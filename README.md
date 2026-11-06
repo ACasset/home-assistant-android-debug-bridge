@@ -1,0 +1,1 @@
+# home-assistant-android-debug-bridge
