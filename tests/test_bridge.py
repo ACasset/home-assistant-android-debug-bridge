@@ -94,6 +94,158 @@ class BridgeTests(unittest.TestCase):
             self.assertEqual(self.bridge.shell("phone", "id"), "\ufffd")
         self.assertEqual(usb.return_value.close.call_count, 3)
 
+    def test_usb_function_success_does_not_probe_or_change_output(self):
+        device = self.usb.return_value
+        device.shell.return_value = b"Permission denied\n"
+        with (
+            patch.object(self.bridge, "_devices", return_value=[{"serial": "phone"}]),
+            patch.object(bridge.time, "sleep") as sleep,
+        ):
+            self.assertEqual(
+                self.bridge.shell("phone", "svc usb setFunctions rndis"),
+                "Permission denied\n",
+            )
+        device.shell.assert_called_once()
+        device.close.assert_called_once()
+        sleep.assert_not_called()
+
+    def test_usb_function_disconnect_checks_mode_without_replaying(self):
+        for command, output in [
+            ("svc usb setFunctions rndis", b"rndis\n"),
+            ("svc usb setFunctions rndis", b"rndis,adb\n"),
+            ("svc usb setFunctions none", b"none\n"),
+            ("svc usb setFunctions none", b"adb\n"),
+            (" svc  usb setFunctions none ", b""),
+        ]:
+            for error_class in bridge._TRANSPORT_ERRORS:
+                with (
+                    self.subTest(command=command, output=output, error=error_class),
+                    patch.object(self.bridge, "_devices", return_value=[{"serial": "phone"}]),
+                    patch.object(bridge.time, "sleep") as sleep,
+                    self.assertLogs("bridge", level="WARNING"),
+                ):
+                    self.usb.reset_mock()
+                    device = self.usb.return_value
+                    device.shell.side_effect = [
+                        error_class("USB disconnected", OSError("disconnected")), output,
+                    ]
+
+                    def connect(**kwargs):
+                        self.assertEqual(
+                            device.close.call_count, device.connect.call_count - 1
+                        )
+                        return True
+
+                    device.connect.side_effect = connect
+                    self.assertEqual(self.bridge.shell("phone", command), "")
+                    self.assertEqual(
+                        [call.args[0] for call in device.shell.call_args_list],
+                        [command, "svc usb getFunctions"],
+                    )
+                    self.assertEqual(device.close.call_count, 2)
+                    sleep.assert_called_once_with(1)
+
+    def test_usb_function_verification_waits_for_reenumeration_and_mode(self):
+        device = self.usb.return_value
+        device.shell.side_effect = [
+            bridge.exceptions.UsbWriteFailedError("USB disconnected"),
+            bridge.exceptions.UsbReadFailedError("USB not ready", OSError("not ready")),
+            b"none\n",
+            b"rndis,adb\n",
+        ]
+        with (
+            patch.object(self.bridge, "_devices", side_effect=[
+                [{"serial": "phone"}], [], [{"serial": "phone"}],
+                [{"serial": "phone"}], [{"serial": "phone"}],
+            ]),
+            patch.object(bridge.time, "sleep") as sleep,
+            self.assertLogs("bridge", level="WARNING"),
+        ):
+            self.assertEqual(self.bridge.shell("phone", "svc usb setFunctions rndis"), "")
+        self.assertEqual(sleep.call_count, 4)
+        self.assertEqual(
+            [call.args[0] for call in device.shell.call_args_list],
+            ["svc usb setFunctions rndis"] + ["svc usb getFunctions"] * 3,
+        )
+        self.assertEqual(device.close.call_count, 4)
+
+    def test_usb_function_unconfirmed_outcome_is_not_success(self):
+        for expected, output in [
+            ("rndis", b"none\n"),
+            ("none", b"rndis,adb\n"),
+            ("none", b"Error: permission denied\n"),
+            ("rndis", b"rndis,mtp\n"),
+        ]:
+            with (
+                self.subTest(expected=expected, output=output),
+                patch.object(self.bridge, "_devices", return_value=[{"serial": "phone"}]),
+                patch.object(bridge.time, "sleep") as sleep,
+                self.assertLogs("bridge", level="WARNING"),
+            ):
+                self.usb.reset_mock()
+                error = bridge.exceptions.UsbWriteFailedError("USB disconnected")
+                self.usb.return_value.shell.side_effect = [error] + [output] * 5
+                with self.assertRaisesRegex(ValueError, "may already have executed") as result:
+                    self.bridge.shell("phone", f"svc usb setFunctions {expected}")
+                self.assertIs(result.exception.__cause__, error)
+                self.assertEqual(sleep.call_count, 5)
+                self.assertEqual(self.usb.return_value.close.call_count, 6)
+
+    def test_usb_function_phone_does_not_reconnect(self):
+        error = bridge.exceptions.UsbReadFailedError(
+            "USB disconnected", OSError("disconnected")
+        )
+        self.usb.return_value.shell.side_effect = error
+        with (
+            patch.object(self.bridge, "_devices", side_effect=[
+                [{"serial": "phone"}], [], [], [], [], [],
+            ]),
+            patch.object(bridge.time, "sleep") as sleep,
+            self.assertLogs("bridge", level="WARNING"),
+            self.assertRaisesRegex(ValueError, "could not be confirmed"),
+        ):
+            self.bridge.shell("phone", "svc usb setFunctions none")
+        self.assertEqual(sleep.call_count, 5)
+        self.usb.return_value.shell.assert_called_once()
+        self.usb.return_value.close.assert_called_once()
+
+    def test_other_shell_commands_are_never_retried(self):
+        for command in [
+            "id", "svc usb getFunctions", "svc usb setFunctions mtp",
+            "svc usb setFunctions rndis; input tap 1 2",
+            "svc usb setFunctions none && echo done",
+        ]:
+            with (
+                self.subTest(command=command),
+                patch.object(self.bridge, "_devices", return_value=[{"serial": "phone"}]),
+                patch.object(bridge.time, "sleep") as sleep,
+            ):
+                self.usb.reset_mock()
+                error = bridge.exceptions.UsbWriteFailedError("USB disconnected")
+                self.usb.return_value.shell.side_effect = error
+                with self.assertRaises(bridge.exceptions.UsbWriteFailedError):
+                    self.bridge.shell("phone", command)
+                self.usb.return_value.shell.assert_called_once()
+                self.usb.return_value.close.assert_called_once()
+                sleep.assert_not_called()
+
+    def test_usb_function_connect_and_non_transport_errors_are_not_suppressed(self):
+        for phase, error in [
+            ("connect", bridge.exceptions.UsbWriteFailedError("Cannot connect")),
+            ("shell", RuntimeError("Unexpected error")),
+        ]:
+            with (
+                self.subTest(phase=phase),
+                patch.object(self.bridge, "_devices", return_value=[{"serial": "phone"}]),
+                patch.object(bridge.time, "sleep") as sleep,
+            ):
+                self.usb.return_value.reset_mock(side_effect=True)
+                getattr(self.usb.return_value, phase).side_effect = error
+                with self.assertRaises(type(error)):
+                    self.bridge.shell("phone", "svc usb setFunctions rndis")
+                self.usb.return_value.close.assert_called_once()
+                sleep.assert_not_called()
+
     def test_sms_quotes_message_and_orders_steps(self):
         message = "Internet down! 'hello'; $(touch /tmp/not-executed)\nPlease check."
         with (

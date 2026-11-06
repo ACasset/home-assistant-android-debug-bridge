@@ -8,10 +8,9 @@ Includes an experimental, coordinate-based SMS action for internet-outage alerts
 ## Installation
 
 Requires Home Assistant 2025.4.4 or later and USB access from **Home Assistant Core**.
-Supervisor is not required.
 
 1. In HACS, open the three-dot menu, select **Custom repositories**, and add
-   `https://github.com/ACasset/home-assistant-android-debug-bridge` with type
+   `https://github.com/ACasset/home-assistant-usb-android-debug-bridge` with type
    **Integration**. This repository is not in the default HACS catalog.
 2. Download **Android Debug Bridge USB** and restart Home Assistant.
 3. Open **Settings → Devices & services → Add integration** and search for
@@ -21,18 +20,6 @@ Supervisor is not required.
 
 For manual installation, copy `custom_components/android_debug_bridge_usb` into
 your configuration directory's `custom_components` folder and restart.
-
-### Migrating from the former app
-
-This repository previously contained a Supervisor app (add-on). Stop and uninstall
-that app before using the integration; competing ADB tools can claim the USB
-interface. The app's standalone web UI is replaced by Home Assistant devices,
-entities, and actions. Its ADB identity is not automatically migrated: authorize
-the integration on the phone again.
-
-If HACS says this repository "holds apps", ensure the repository revision you are
-installing contains `hacs.json` and `custom_components`, then remove and re-add the
-custom repository as an **Integration**.
 
 ## USB and phone setup
 
@@ -44,8 +31,7 @@ custom repository as an **Integration**.
    Home Assistant Container needs USB device passthrough and suitable device
    permissions, including permission for devices reconnected after startup.
    HACS cannot grant USB permissions or install host system libraries.
-   On Home Assistant OS, the integration runs inside Core, not the former app:
-   if enumeration fails, check Core's USB access rather than app settings.
+   On Home Assistant OS, if enumeration fails, check Core's USB access.
 4. Open **Developer tools → Actions**, run
    `android_debug_bridge_usb.list_devices`, and note the phone's `serial`.
 5. Run `android_debug_bridge_usb.shell` with that serial and command
@@ -82,6 +68,21 @@ Other commands include `input keyevent KEYCODE_HOME`, `input text Hello`, and
 `dumpsys battery`. Actions are administrator-only for user-initiated calls;
 automations and scripts can also call them. Only let trusted users edit scripts
 and automations that send commands to your phone.
+
+### Changing USB tethering
+
+Use `svc usb setFunctions rndis` to enable tethering or
+`svc usb setFunctions none` to disable it, subject to the phone's permissions.
+Changing USB functions can disconnect ADB before it finishes returning the
+response, even when Android has applied the change.
+
+For these two standalone commands only, a transport error triggers up to five
+reconnection checks with `svc usb getFunctions`, separated by one second.
+The command is **never resent**. If the reported mode matches (ignoring the ADB
+function), the action returns `{"output": ""}` and logs the recovery. Otherwise,
+it reports an unconfirmed outcome: check the phone before retrying. Keep USB
+debugging enabled and ensure VM/container USB access survives re-enumeration.
+Compound shell commands and other commands retain normal error handling.
 
 ### SMS alerts when internet is lost
 
@@ -148,7 +149,7 @@ app with SMS permission or a supported cellular modem.
 ## Security and troubleshooting
 
 Only send trusted commands: Android shell access can modify or delete phone data.
-There is no standalone HTTP server or exposed network port.
+There is no exposed network port.
 
 The ADB identity is stored in
 `<config>/.storage/android_debug_bridge_usb/adbkey` and `adbkey.pub`, with the

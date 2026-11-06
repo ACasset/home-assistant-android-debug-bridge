@@ -1,5 +1,6 @@
 """Serialized USB ADB operations, run outside Home Assistant's event loop."""
 
+import logging
 from pathlib import Path
 import re
 import shlex
@@ -7,11 +8,20 @@ import threading
 import time
 from typing import TypedDict
 
+from adb_shell import exceptions
 from adb_shell.auth.keygen import keygen, write_public_keyfile
 from adb_shell.auth.sign_pythonrsa import PythonRSASigner
 
 
 MAX_OUTPUT = 1024 * 1024
+_LOGGER = logging.getLogger(__name__)
+_USB_FUNCTION_COMMAND = re.compile(r"\s*svc\s+usb\s+setFunctions\s+(none|rndis)\s*")
+_TRANSPORT_ERRORS = (
+    exceptions.UsbReadFailedError,
+    exceptions.UsbWriteFailedError,
+    exceptions.AdbConnectionError,
+    exceptions.AdbTimeoutError,
+)
 
 
 class UsbDevice(TypedDict):
@@ -67,14 +77,51 @@ class Bridge:
                     rsa_keys=[self.signer], auth_timeout_s=60.0, read_timeout_s=60.0
                 ):
                     raise ValueError("ADB authorization failed. Unlock the phone and allow USB debugging.")
-                output = device.shell(
-                    command, read_timeout_s=30.0, timeout_s=60.0, decode=False
-                )
-                if len(output) > MAX_OUTPUT:
-                    raise ValueError("Command output exceeded 1 MiB. Use a smaller command.")
-                return output.decode("utf-8", errors="replace")
+                try:
+                    output = device.shell(
+                        command, read_timeout_s=30.0, timeout_s=60.0, decode=False
+                    )
+                except _TRANSPORT_ERRORS as err:
+                    usb_function = _USB_FUNCTION_COMMAND.fullmatch(command)
+                    if usb_function is None:
+                        raise
+                    disconnect_error = err
+                else:
+                    if len(output) > MAX_OUTPUT:
+                        raise ValueError("Command output exceeded 1 MiB. Use a smaller command.")
+                    return output.decode("utf-8", errors="replace")
             finally:
                 device.close()
+            return self._verify_usb_functions(
+                serial, usb_function[1], disconnect_error
+            )
+
+    def _verify_usb_functions(
+        self, serial: str, expected: str, disconnect_error: Exception
+    ) -> str:
+        """Check the requested mode after re-enumeration without replaying a write."""
+        _LOGGER.warning(
+            "USB disconnected during setFunctions %s; checking the resulting mode "
+            "without resending the command",
+            expected,
+        )
+        for _ in range(5):
+            time.sleep(1)
+            try:
+                output = self.shell(serial, "svc usb getFunctions")
+            except (*_TRANSPORT_ERRORS, exceptions.UsbDeviceNotFoundError, ValueError):
+                _LOGGER.debug("USB mode verification could not connect", exc_info=True)
+                continue
+            functions = {part.strip() for part in output.strip().split(",")}
+            functions.difference_update({"", "none", "adb"})
+            if functions == ({"rndis"} if expected == "rndis" else set()):
+                _LOGGER.info("USB mode %s confirmed after reconnection", expected)
+                return ""
+        raise ValueError(
+            f"USB disconnected during setFunctions {expected}; the requested mode "
+            "could not be confirmed. The command may already have executed. "
+            "Check the phone and USB connection before retrying."
+        ) from disconnect_error
 
     def send_sms(
         self,
