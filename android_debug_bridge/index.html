@@ -1,0 +1,82 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Android Debug Bridge USB</title>
+  <style>
+    body { font: 1rem system-ui; max-width: 60rem; margin: 2rem auto; padding: 0 1rem; }
+    textarea, pre { box-sizing: border-box; width: 100%; padding: 1rem; }
+    pre { white-space: pre-wrap; overflow-wrap: anywhere; background: #eee; color: #111; }
+    button, select { margin: .5rem 0; padding: .5rem; }
+  </style>
+</head>
+<body>
+  <h1>Android Debug Bridge USB</h1>
+  <p>Enable USB debugging and unlock your phone. On first connection, approve the
+    authorization prompt (a request may wait up to 60 seconds).</p>
+  <p>Commands run in the Android shell, not on Home Assistant. Do not include
+    <code>adb shell</code>. Only run commands you trust.</p>
+  <label for="device">USB device</label>
+  <select id="device"></select>
+  <button id="refresh" type="button">Refresh devices</button>
+  <form id="shell">
+    <label for="command">Shell command</label>
+    <textarea id="command" rows="3" maxlength="8192" required
+      placeholder="getprop ro.product.model"></textarea>
+    <button id="run" type="submit">Run command</button>
+  </form>
+  <pre id="output" role="status" aria-live="polite"></pre>
+  <script>
+    const output = document.getElementById("output");
+    const device = document.getElementById("device");
+    const refresh = document.getElementById("refresh");
+    const run = document.getElementById("run");
+    async function request(path, options) {
+      const response = await fetch(path, options);
+      const data = await response.json();
+      if (!response.ok) throw new Error(data.error || "Request failed");
+      return data;
+    }
+    refresh.onclick = async () => {
+      refresh.disabled = true;
+      try {
+        const data = await request("api/devices");
+        device.replaceChildren();
+        for (const item of data.devices) {
+          const option = document.createElement("option");
+          option.value = item.serial;
+          option.textContent = item.serial || "(device has no serial)";
+          device.append(option);
+        }
+        output.textContent = data.devices.length ? "Select a device and run a command." :
+          "No ADB USB devices found. Check USB debugging and the data cable.";
+      } catch (error) {
+        output.textContent = error.message;
+      } finally {
+        refresh.disabled = false;
+      }
+    };
+    document.getElementById("shell").onsubmit = async (event) => {
+      event.preventDefault();
+      run.disabled = true;
+      output.textContent = "Connecting… Check your phone for an authorization prompt.";
+      try {
+        const data = await request("api/shell", {
+          method: "POST",
+          headers: {"Content-Type": "application/json", "X-ADB-Token": "{{TOKEN}}"},
+          body: JSON.stringify({
+            serial: device.value, command: document.getElementById("command").value
+          })
+        });
+        output.textContent = data.output || "(no output)";
+      } catch (error) {
+        output.textContent = error.message;
+      } finally {
+        run.disabled = false;
+      }
+    };
+    refresh.click();
+  </script>
+</body>
+</html>
