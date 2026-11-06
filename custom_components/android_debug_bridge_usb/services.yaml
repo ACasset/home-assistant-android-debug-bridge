@@ -1,0 +1,82 @@
+shell:
+  name: Run shell command
+  description: >-
+    Send an Android shell command to one USB phone. Administrator access is
+    required for user-initiated calls. Returns output when a response is requested.
+  fields:
+    serial:
+      name: Serial
+      description: Exact USB serial from the phone's connection entity or list_devices.
+      required: true
+      example: ABC123
+      selector:
+        text:
+    command:
+      name: Command
+      description: Android shell command without the adb shell prefix (1-8192 characters).
+      required: true
+      example: getprop ro.product.model
+      selector:
+        text:
+          multiline: true
+list_devices:
+  name: Discover USB phones
+  description: >-
+    Refresh discovery immediately and return devices with serial and port_path.
+    Administrator access is required for user-initiated calls.
+send_sms:
+  name: Attempt SMS using the phone UI
+  description: >-
+    Wake the phone, open a prefilled SMS composer, wait, and tap calibrated Send
+    coordinates once. Requires an unlocked phone and a configured SMS app/SIM.
+    Does not confirm sending or delivery. Test on your phone before automating.
+  fields:
+    serial:
+      name: Serial
+      required: true
+      selector:
+        text:
+    recipient:
+      name: Recipient
+      description: One number, 3-15 digits, optionally prefixed with +.
+      required: true
+      selector:
+        text:
+    message:
+      name: Message
+      required: true
+      selector:
+        text:
+          multiline: true
+    send_x:
+      name: Send button X coordinate
+      required: true
+      selector:
+        number:
+          min: 0
+          max: 10000
+          mode: box
+    send_y:
+      name: Send button Y coordinate
+      required: true
+      selector:
+        number:
+          min: 0
+          max: 10000
+          mode: box
+    wait_seconds:
+      name: Composer wait time
+      default: 3
+      selector:
+        number:
+          min: 1
+          max: 10
+          mode: box
+    confirm_ui_risk:
+      name: Accept UI automation risk
+      description: >-
+        Must be enabled. Coordinates can tap the wrong control if the UI changes.
+        A tap does not confirm SMS sending or delivery. Never retry blindly.
+      required: true
+      selector:
+        boolean:

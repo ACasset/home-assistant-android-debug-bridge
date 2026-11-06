@@ -1,0 +1,15 @@
+{
+  "title": "Android Debug Bridge USB",
+  "config": {
+    "step": {
+      "user": {
+        "title": "Set up USB Android Debug Bridge",
+        "description": "Discover USB-connected Android phones on this Home Assistant host. Enable USB debugging on each phone and ensure Home Assistant Core can access the USB devices. Phones are scanned every 30 seconds."
+      }
+    },
+    "abort": {
+      "already_configured": "The USB ADB hub is already configured.",
+      "single_instance_allowed": "Only one USB ADB hub can be configured."
+    }
+  }
+}

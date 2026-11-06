@@ -1,0 +1,2 @@
+homeassistant==2025.4.4
+adb-shell[usb]==0.4.4
