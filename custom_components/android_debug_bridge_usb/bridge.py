@@ -39,6 +39,11 @@ _KEYCODE_DEL = 67
 _KEYCODE_FORWARD_DEL = 112
 _MAX_DRAFT = 2000
 _NOTHING_SENT = "Nothing was sent."
+# The USB transport fails a read after this long without data, whatever the
+# overall read timeout, so it must cover slow silent commands such as
+# `am start -W` or `uiautomator dump`.
+_SHELL_TRANSPORT_TIMEOUT = 30.0
+_SMS_STEP_ATTEMPTS = 3
 
 
 class UsbDevice(TypedDict):
@@ -57,6 +62,10 @@ class ShellResult(NamedTuple):
 
 class _UiDumpError(ValueError):
     """The phone screen could not be read."""
+
+
+class _UsbFailure(ValueError):
+    """A repeatable SMS step kept failing to reach the phone."""
 
 
 class _ProbeUnauthorized(Exception):
@@ -195,7 +204,11 @@ class Bridge:
                     raise ValueError("ADB authorization failed. Unlock the phone and allow USB debugging.")
                 try:
                     output = device.shell(
-                        wrapped, read_timeout_s=30.0, timeout_s=60.0, decode=False
+                        wrapped,
+                        transport_timeout_s=_SHELL_TRANSPORT_TIMEOUT,
+                        read_timeout_s=30.0,
+                        timeout_s=60.0,
+                        decode=False,
                     )
                 except _TRANSPORT_ERRORS as err:
                     usb_function = _USB_FUNCTION_COMMAND.fullmatch(command)
@@ -282,39 +295,47 @@ class Bridge:
             raise ValueError("Encoded message exceeds the shell command limit.")
         # Hold the same lock across all steps so other actions cannot steal focus.
         with self.lock:
-            wake_output = self.shell(serial, "input keyevent KEYCODE_WAKEUP")
-            if wake_output.strip():
-                raise ValueError(f"Cannot wake phone: {wake_output}")
-            power = self.shell(
-                serial,
-                "wm dismiss-keyguard >/dev/null 2>&1; dumpsys power | grep mWakefulness=",
-            )
-            if "mWakefulness=" in power and "mWakefulness=Awake" not in power:
-                raise ValueError(f"The phone screen did not turn on. {_NOTHING_SENT}")
-            package = self._open_composer(serial, intent, wait_seconds)
+            try:
+                wake_output = self._step(serial, "input keyevent KEYCODE_WAKEUP")
+                if wake_output.strip():
+                    raise ValueError(f"Cannot wake phone: {wake_output}")
+                power = self._step(
+                    serial,
+                    "wm dismiss-keyguard >/dev/null 2>&1; "
+                    "dumpsys power | grep mWakefulness=",
+                )
+                if "mWakefulness=" in power and "mWakefulness=Awake" not in power:
+                    raise ValueError(
+                        f"The phone screen did not turn on. {_NOTHING_SENT}"
+                    )
+                package = self._open_composer(serial, intent, wait_seconds)
+                if verify_ui:
+                    nodes = self._dump_ui(serial)
+                    field = self._message_field(nodes, message)
+                    if field is None:
+                        self._clear_draft(serial, nodes, package)
+                        self._open_composer(serial, intent, wait_seconds)
+                        nodes = self._dump_ui(serial)
+                        field = self._message_field(nodes, message)
+                    if field is None:
+                        raise ValueError(
+                            "The SMS app is not showing the requested message "
+                            "(wrong screen, dialog, or an app that ignores "
+                            f"prefilled text). {_NOTHING_SENT}"
+                        )
+                    package = field.get("package", "")
+                    x, y, source = self._send_target(nodes, package, send_x, send_y)
+            except _UsbFailure as err:
+                raise ValueError(f"{err} {_NOTHING_SENT}") from err
             if not verify_ui:
-                self._tap(serial, send_x, send_y)
+                self._tap_send(serial, send_x, send_y)
                 return {"send_button": "coordinates", "composer_cleared": None}
 
-            nodes = self._dump_ui(serial)
-            field = self._message_field(nodes, message)
-            if field is None:
-                self._clear_draft(serial, nodes, package)
-                self._open_composer(serial, intent, wait_seconds)
-                nodes = self._dump_ui(serial)
-                field = self._message_field(nodes, message)
-            if field is None:
-                raise ValueError(
-                    "The SMS app is not showing the requested message (wrong screen, "
-                    f"dialog, or an app that ignores prefilled text). {_NOTHING_SENT}"
-                )
-            package = field.get("package", "")
-            x, y, source = self._send_target(nodes, package, send_x, send_y)
-            self._tap(serial, x, y)
+            self._tap_send(serial, x, y)
             time.sleep(2)
             try:
                 nodes = self._dump_ui(serial)
-            except _UiDumpError:
+            except (_UiDumpError, _UsbFailure):
                 _LOGGER.warning("Send was tapped but the screen could not be re-read")
                 return {"send_button": source, "composer_cleared": None}
             if self._message_field(nodes, message, package) is not None:
@@ -324,17 +345,55 @@ class Bridge:
                 )
             return {"send_button": source, "composer_cleared": True}
 
+    def _step(self, serial: str, command: str) -> str:
+        """Run a repeatable SMS step, retrying when the phone cannot be reached.
+
+        Only for steps that cannot send anything: never for the tap on Send.
+        """
+        for attempt in range(_SMS_STEP_ATTEMPTS):
+            if attempt:
+                time.sleep(1)
+            try:
+                return self.execute(serial, command).output
+            except (ValueError, exceptions.DeviceAuthError):
+                raise
+            except Exception as err:  # noqa: BLE001 - libusb errors vary by host
+                error = err
+                _LOGGER.warning(
+                    "USB communication failed during an SMS step (attempt %d of %d): "
+                    "%s: %s",
+                    attempt + 1, _SMS_STEP_ATTEMPTS, type(err).__name__, err,
+                )
+        raise _UsbFailure(
+            "USB communication with the phone failed "
+            f"({type(error).__name__}: {error})."
+        ) from error
+
+    def _tap_send(self, serial: str, x: int, y: int) -> None:
+        """Tap Send exactly once; a failure here leaves the outcome unknown."""
+        try:
+            self._tap(serial, x, y)
+        except (ValueError, exceptions.DeviceAuthError):
+            raise
+        except Exception as err:  # noqa: BLE001 - libusb errors vary by host
+            raise ValueError(
+                "USB communication failed while tapping Send "
+                f"({type(err).__name__}: {err}), so the SMS may or may not have "
+                "been sent. Check the phone before retrying."
+            ) from err
+
     def _open_composer(self, serial: str, intent: str, wait_seconds: float) -> str | None:
         """Open the prefilled composer and return the app package when reported."""
-        output = self.shell(serial, intent)
+        output = self._step(serial, intent)
         if "Status: ok" not in output or "Error:" in output or "Exception" in output:
             raise ValueError(f"Cannot open SMS composer: {output}")
         time.sleep(wait_seconds)
         activity = re.search(r"^Activity: ([\w.]+)/", output, re.MULTILINE)
         return activity[1] if activity else None
 
-    def _tap(self, serial: str, x: int, y: int) -> None:
-        output = self.shell(serial, f"input tap {x} {y}")
+    def _tap(self, serial: str, x: int, y: int, repeatable: bool = False) -> None:
+        run = self._step if repeatable else self.shell
+        output = run(serial, f"input tap {x} {y}")
         if output.strip():
             raise ValueError(f"Tap reported an error: {output}")
 
@@ -344,14 +403,14 @@ class Bridge:
             if attempt:
                 # uiautomator fails transiently while the screen is animating.
                 time.sleep(1)
-            result = self.execute(serial, _UI_DUMP_COMMAND)
-            start = result.output.find("<hierarchy")
-            end = result.output.rfind("</hierarchy>")
+            output = self._step(serial, _UI_DUMP_COMMAND)
+            start = output.find("<hierarchy")
+            end = output.rfind("</hierarchy>")
             if start < 0 or end < 0:
                 continue
             try:
                 root = ElementTree.fromstring(
-                    result.output[start : end + len("</hierarchy>")]
+                    output[start : end + len("</hierarchy>")]
                 )
             except ElementTree.ParseError:
                 continue
@@ -402,12 +461,12 @@ class Bridge:
             length,
         )
         left, top, right, bottom = bounds
-        self._tap(serial, (left + right) // 2, (top + bottom) // 2)
+        self._tap(serial, (left + right) // 2, (top + bottom) // 2, repeatable=True)
         # The cursor position is unknown, so delete in both directions.
         keys = [_KEYCODE_DEL] * length + [_KEYCODE_FORWARD_DEL] * length
         for index in range(0, len(keys), 400):
             chunk = " ".join(str(key) for key in keys[index : index + 400])
-            output = self.shell(serial, f"input keyevent {chunk}")
+            output = self._step(serial, f"input keyevent {chunk}")
             if output.strip():
                 raise ValueError(f"Cannot clear the SMS composer: {output}")
 
