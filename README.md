@@ -230,4 +230,5 @@ The tests mock USB hardware. Real USB enumeration and Android authorization must
 also be verified on the Home Assistant host with a connected phone.
 
 GitHub Actions runs these tests, Home Assistant's `hassfest` and the HACS
-validation on every pull request, on pushes to `main`, and weekly.
+validation on every pull request, on pushes to `main`, and weekly. The HACS
+validation skips the license check because the repository has no license yet.

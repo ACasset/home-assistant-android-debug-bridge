@@ -37,5 +37,5 @@ jobs:
       - uses: hacs/action@main
         with:
           category: integration
-          # The repository has no brand assets, description or topics yet.
-          ignore: brands description topics
+          # The repository has no brand assets, description, topics or license yet.
+          ignore: brands description topics license
