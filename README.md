@@ -169,6 +169,13 @@ Core's USB permissions, and competing ADB tools. Failures are reported as action
 errors or unavailable entities, with details in Home Assistant logs.
 USB support in `adb-shell` is experimental and may vary by phone and host.
 
+If setup reports `No module named 'usb1'` after a Home Assistant update, update
+this integration in HACS (or replace its files for a manual installation) and
+restart Home Assistant. The integration explicitly requires `libusb1`, the Python
+package providing `usb1`: Home Assistant's dependency check can skip the USB extra
+when `adb-shell` is already installed. No ADB key reset or integration removal is
+needed. This Python dependency is separate from the host system `libusb` library.
+
 ## Development
 
 Install the system `libusb-1.0` library (on Debian/Ubuntu,
