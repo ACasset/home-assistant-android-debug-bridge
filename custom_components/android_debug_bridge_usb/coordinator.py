@@ -5,12 +5,14 @@ from datetime import timedelta
 import logging
 import time
 
+from homeassistant.config_entries import ConfigEntry
 from homeassistant.core import HomeAssistant, callback
+from homeassistant.helpers import device_registry as dr
 from homeassistant.helpers import issue_registry as ir
 from homeassistant.helpers.update_coordinator import DataUpdateCoordinator, UpdateFailed
 
 from .bridge import Bridge, UsbDevice
-from .const import DOMAIN
+from .const import CONF_SERIAL, DOMAIN
 
 _LOGGER = logging.getLogger(__name__)
 # A phone that answers is probed rarely to limit USB traffic; one that does not
@@ -21,14 +23,29 @@ PROBE_INTERVAL = 300
 class UsbCoordinator(DataUpdateCoordinator[dict[str, UsbDevice]]):
     """Track connected phones by unambiguous, nonempty serial number."""
 
-    def __init__(self, hass: HomeAssistant, bridge: Bridge) -> None:
+    def __init__(self, hass: HomeAssistant, entry: ConfigEntry, bridge: Bridge) -> None:
         super().__init__(
-            hass, _LOGGER, name=DOMAIN, update_interval=timedelta(seconds=30)
+            hass, _LOGGER, name=DOMAIN, config_entry=entry,
+            update_interval=timedelta(seconds=30),
         )
         self.bridge = bridge
         self.adb_ready: dict[str, bool] = {}
+        self.models: dict[str, str] = {}
         self._probed_at: dict[str, float] = {}
         self._ignored: tuple | None = None
+
+    def resolve_serial(self, serial: str | None) -> str:
+        """Return the phone an action targets: explicit, default, or the only one."""
+        serial = serial or self.config_entry.options.get(CONF_SERIAL)
+        if serial:
+            return serial
+        if self.data and len(self.data) == 1:
+            return next(iter(self.data))
+        raise ValueError(
+            f"No phone selected and {len(self.data or ())} phones are connected. "
+            "Choose a default phone with Configure on the Android Debug Bridge USB "
+            "integration, or pass a serial."
+        )
 
     async def _async_update_data(self) -> dict[str, UsbDevice]:
         try:
@@ -68,14 +85,15 @@ class UsbCoordinator(DataUpdateCoordinator[dict[str, UsbDevice]]):
 
     async def _async_probe(self, serial: str) -> None:
         try:
-            ready = await self.hass.async_add_executor_job(self.bridge.probe, serial)
+            model = await self.hass.async_add_executor_job(self.bridge.probe, serial)
         except Exception:  # noqa: BLE001 - any failure means "not ready"
             _LOGGER.debug("ADB probe of %s failed", serial, exc_info=True)
             self.adb_ready[serial] = False
             self._probed_at[serial] = time.monotonic()
             return
-        if ready is True:
+        if isinstance(model, str):
             self._set_ready(serial)
+            self._set_model(serial, model)
             return
         self.adb_ready[serial] = False
         self._probed_at[serial] = time.monotonic()
@@ -93,6 +111,16 @@ class UsbCoordinator(DataUpdateCoordinator[dict[str, UsbDevice]]):
         self.adb_ready[serial] = True
         self._probed_at[serial] = time.monotonic()
         ir.async_delete_issue(self.hass, DOMAIN, f"adb_unauthorized_{serial}")
+
+    def _set_model(self, serial: str, model: str) -> None:
+        """Remember the model; the device registry keeps it while unplugged."""
+        if not model or self.models.get(serial) == model:
+            return
+        self.models[serial] = model
+        registry = dr.async_get(self.hass)
+        device = registry.async_get_device(identifiers={(DOMAIN, serial)})
+        if device is not None and device.model != model:
+            registry.async_update_device(device.id, model=model)
 
     def _forget(self, serial: str) -> None:
         self.adb_ready.pop(serial, None)

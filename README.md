@@ -32,11 +32,26 @@ your configuration directory's `custom_components` folder and restart.
    permissions, including permission for devices reconnected after startup.
    HACS cannot grant USB permissions or install host system libraries.
    On Home Assistant OS, if enumeration fails, check Core's USB access.
-4. Open **Developer tools → Actions**, run
-   `android_debug_bridge_usb.list_devices`, and note the phone's `serial`.
-5. Run `android_debug_bridge_usb.shell` with that serial and command
-   `getprop ro.product.model`. Unlock the phone and accept **Allow USB debugging?**.
+4. Open **Developer tools → Actions** and run `android_debug_bridge_usb.shell`
+   with the command `getprop ro.product.model` (with a single phone connected, no
+   serial is needed). Unlock the phone and accept **Allow USB debugging?**.
    If authorization times out, approve and retry.
+5. Optionally choose a **default phone**: open **Settings → Devices & services →
+   Android Debug Bridge USB → Configure** and pick it in the list, which shows
+   each discovered phone as `model (serial)`. The model appears once the phone
+   has authorized USB debugging (within five minutes of the first approval).
+
+### Which phone an action targets
+
+`serial` is optional in `shell` and `send_sms`. An action uses, in this order:
+the `serial` it is given, the default phone chosen with **Configure**, or the
+only connected phone. With no serial, no default and zero or several phones
+connected, it fails without running anything. A default phone that is unplugged
+is never silently replaced by another one.
+
+If you do pass a serial in YAML, quote it (`serial: "0123456789"`): unquoted,
+a serial made of digits is read as a number and may no longer match. When no
+phone matches, the error lists the serials that are connected.
 
 **USB connected** reports USB presence, not ADB authorization. Disconnected
 phones turn off; enumeration failures make sensors unavailable. A phone whose
@@ -59,10 +74,11 @@ at that moment: they then fail with "The USB ADB hub is not loaded" instead of
 being unknown to your automations.
 
 `android_debug_bridge_usb.list_devices` refreshes discovery immediately and
-returns `{"devices": [{"serial": "ABC123", "port_path": [1, 2]}]}`.
+returns `{"devices": [{"serial": "ABC123", "port_path": [1, 2], "model": "Pixel 7"}]}`
+(`model` is `null` until the phone has authorized USB debugging).
 
-`android_debug_bridge_usb.shell` accepts an exact `serial` and a `command`
-(1-8192 characters, without `adb shell`). It optionally returns
+`android_debug_bridge_usb.shell` accepts a `command`
+(1-8192 characters, without `adb shell`) and an optional exact `serial`. It optionally returns
 `{"output": "...", "exit_code": 0}`. `exit_code` is the Android exit status of
 the command (0 means success), or `null` if the phone did not report it. The
 action does not fail on a nonzero status; test it in your automation, for
@@ -74,7 +90,6 @@ For example, in a script:
 sequence:
   - action: android_debug_bridge_usb.shell
     data:
-      serial: ABC123
       command: getprop ro.product.model
     response_variable: phone_result
   - action: persistent_notification.create
@@ -156,7 +171,8 @@ Prepare a dedicated phone:
    ADB still works over USB; cellular SMS service must remain available.
 
 Example automation, using an **existing internet-connectivity binary sensor**
-(replace its entity ID, phone serial and recipient; `send_x`/`send_y` are only
+(replace its entity ID and recipient; add `serial` if you have several phones
+and no default phone; `send_x`/`send_y` are only
 needed if your Send button is not identified automatically):
 
 ```yaml
@@ -171,7 +187,6 @@ triggers:
 actions:
   - action: android_debug_bridge_usb.send_sms
     data:
-      serial: ABC123
       recipient: "+15551234567"
       message: "Home Assistant: regular internet has been offline for 2 minutes."
       send_x: 980
@@ -213,6 +228,12 @@ interactive terminals, and binary output are not supported.
 If no device appears, check the cable, USB debugging, VM/container passthrough,
 Core's USB permissions, and competing ADB tools. Failures are reported as action
 errors or unavailable entities, with details in Home Assistant logs.
+
+Before each command the phone is looked up again on the USB bus, with three
+attempts half a second apart because a phone is briefly absent or unreadable
+while it re-enumerates. "No connected USB phone has the serial ..." then lists
+the serials that are connected and, if a device could not be identified, the
+USB error that prevented it.
 USB support in `adb-shell` is experimental and may vary by phone and host.
 
 If setup reports `No module named 'usb1'` after a Home Assistant update, update

@@ -9,5 +9,5 @@
   "issue_tracker": "https://github.com/ACasset/home-assistant-usb-android-debug-bridge/issues",
   "requirements": ["adb-shell[usb]>=0.4.4", "libusb1==3.3.1"],
   "single_config_entry": true,
-  "version": "0.3.0"
+  "version": "0.4.0"
 }

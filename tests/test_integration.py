@@ -18,6 +18,8 @@ import voluptuous as vol
 from custom_components.android_debug_bridge_usb.const import DOMAIN
 
 PHONE = {"serial": "phone", "port_path": [1, 2]}
+SECOND = {"serial": "second", "port_path": [1, 3]}
+LISTED = PHONE | {"model": "Pixel 7"}
 SMS = {
     "serial": "phone", "recipient": "+123456789", "message": "Internet down",
     "send_x": 900, "send_y": 1800, "confirm_ui_risk": True,
@@ -41,7 +43,7 @@ class IntegrationTests(unittest.IsolatedAsyncioTestCase):
         self.bridge = Mock()
         self.bridge.devices.return_value = [PHONE]
         self.bridge.execute.return_value = Mock(output="Pixel\n", exit_code=0)
-        self.bridge.probe.return_value = True
+        self.bridge.probe.return_value = "Pixel 7"
         self.bridge.send_sms.return_value = {
             "send_button": "detected", "composer_cleared": True,
         }
@@ -95,7 +97,8 @@ class IntegrationTests(unittest.IsolatedAsyncioTestCase):
         second = {"serial": "second", "port_path": [1, 3]}
         self.bridge.devices.return_value = [PHONE, second]
         self.assertEqual(
-            await self.call("list_devices"), {"devices": [PHONE, second]}
+            await self.call("list_devices"),
+            {"devices": [LISTED, second | {"model": "Pixel 7"}]},
         )
         await self.hass.async_block_till_done()
         self.assertEqual(self.phone_state().state, "on")
@@ -205,7 +208,10 @@ class IntegrationTests(unittest.IsolatedAsyncioTestCase):
             {"serial": None, "port_path": None}, second,
         ]
         with self.assertLogs("custom_components.android_debug_bridge_usb", level="WARNING"):
-            self.assertEqual(await self.call("list_devices"), {"devices": [second]})
+            self.assertEqual(
+                await self.call("list_devices"),
+                {"devices": [second | {"model": "Pixel 7"}]},
+            )
         await self.hass.async_block_till_done()
         self.assertEqual(self.phone_state("second").state, "on")
         self.assertEqual(self.phone_state().state, "off")
@@ -219,7 +225,7 @@ class IntegrationTests(unittest.IsolatedAsyncioTestCase):
         self.bridge.probe.assert_not_called()
 
         # The phone no longer trusts this host: probed again once the result is stale.
-        self.bridge.probe.return_value = False
+        self.bridge.probe.return_value = None
         with patch(
             "custom_components.android_debug_bridge_usb.coordinator.PROBE_INTERVAL", 0
         ):
@@ -253,6 +259,67 @@ class IntegrationTests(unittest.IsolatedAsyncioTestCase):
         await coordinator.async_refresh()
         await self.hass.async_block_till_done()
         self.assertEqual(self.phone_state(sensor="adb_ready").state, "unavailable")
+
+    async def test_default_phone_option_and_action_target(self):
+        models = {"phone": "Pixel 7", "second": None}
+        self.bridge.probe.side_effect = lambda serial: models[serial]
+        self.bridge.devices.return_value = [PHONE, SECOND]
+        coordinator = await self.setup_hub()
+        command = {"command": "id"}
+        sms = {key: value for key, value in SMS.items() if key != "serial"}
+
+        # Several phones and no default: nothing is guessed.
+        for service, data in [("shell", command), ("send_sms", sms)]:
+            with self.assertRaisesRegex(ServiceValidationError, "No phone selected"):
+                await self.call(service, data)
+        self.bridge.execute.assert_not_called()
+        self.bridge.send_sms.assert_not_called()
+
+        # The dropdown shows the model, and falls back to the serial without one.
+        flow = await self.hass.config_entries.options.async_init(self.entry.entry_id)
+        self.assertEqual(flow["type"], "form")
+        selector = flow["data_schema"].schema["serial"]
+        self.assertEqual(selector.config["options"], [
+            {"value": "phone", "label": "Pixel 7 (phone)"},
+            {"value": "second", "label": "second"},
+        ])
+        result = await self.hass.config_entries.options.async_configure(
+            flow["flow_id"], {"serial": "second"}
+        )
+        self.assertEqual(result["type"], "create_entry")
+        await self.call("shell", command)
+        self.bridge.execute.assert_called_with("second", "id")
+        await self.call("send_sms", sms)
+        self.assertEqual(self.bridge.send_sms.call_args.args[0], "second")
+        # An explicit serial wins, and an unplugged default is not replaced.
+        await self.call("shell", command | {"serial": "phone"})
+        self.bridge.execute.assert_called_with("phone", "id")
+        self.bridge.devices.return_value = [PHONE]
+        await coordinator.async_refresh()
+        await self.call("shell", command)
+        self.bridge.execute.assert_called_with("second", "id")
+
+        # Clearing the default leaves the only connected phone as the target.
+        flow = await self.hass.config_entries.options.async_init(self.entry.entry_id)
+        await self.hass.config_entries.options.async_configure(flow["flow_id"], {})
+        self.assertEqual(self.entry.options, {})
+        await self.call("shell", command)
+        self.bridge.execute.assert_called_with("phone", "id")
+
+    async def test_model_learned_after_authorization_reaches_the_device(self):
+        self.bridge.probe.return_value = None
+        coordinator = await self.setup_hub()
+        registry = dr.async_get(self.hass)
+        self.assertIsNone(registry.async_get_device({(DOMAIN, "phone")}).model)
+        self.bridge.probe.return_value = "Pixel 7"
+        await coordinator.async_refresh()
+        self.assertEqual(registry.async_get_device({(DOMAIN, "phone")}).model, "Pixel 7")
+        # The stored model survives a restart while the phone is unplugged.
+        self.assertTrue(await self.hass.config_entries.async_unload(self.entry.entry_id))
+        self.bridge.devices.return_value = []
+        self.assertTrue(await self.hass.config_entries.async_setup(self.entry.entry_id))
+        await self.hass.async_block_till_done()
+        self.assertEqual(registry.async_get_device({(DOMAIN, "phone")}).model, "Pixel 7")
 
     async def test_initial_discovery_failure_retries_setup(self):
         self.bridge.devices.side_effect = OSError("USB denied")

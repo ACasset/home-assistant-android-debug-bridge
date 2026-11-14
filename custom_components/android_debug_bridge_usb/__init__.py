@@ -19,7 +19,7 @@ from homeassistant.helpers import config_validation as cv
 from homeassistant.helpers.typing import ConfigType
 
 from .bridge import Bridge
-from .const import DOMAIN
+from .const import CONF_SERIAL, DOMAIN
 from .coordinator import UsbCoordinator
 
 _LOGGER = logging.getLogger(__name__)
@@ -54,8 +54,8 @@ async def async_setup(hass: HomeAssistant, config: ConfigType) -> bool:
 
     async def async_shell(call: ServiceCall) -> dict:
         coordinator = await _async_hub(hass, call)
-        serial = call.data["serial"]
         try:
+            serial = coordinator.resolve_serial(call.data.get(CONF_SERIAL))
             result = await hass.async_add_executor_job(
                 coordinator.bridge.execute, serial, call.data["command"]
             )
@@ -76,12 +76,17 @@ async def async_setup(hass: HomeAssistant, config: ConfigType) -> bool:
         await coordinator.async_refresh()
         if not coordinator.last_update_success:
             raise HomeAssistantError("Cannot enumerate USB devices. Check Home Assistant logs.")
-        return {"devices": list(coordinator.data.values())}
+        return {
+            "devices": [
+                {**device, "model": coordinator.models.get(serial)}
+                for serial, device in coordinator.data.items()
+            ]
+        }
 
     async def async_send_sms(call: ServiceCall) -> dict:
         coordinator = await _async_hub(hass, call)
-        serial = call.data["serial"]
         try:
+            serial = coordinator.resolve_serial(call.data.get(CONF_SERIAL))
             details = await hass.async_add_executor_job(
                 coordinator.bridge.send_sms,
                 serial,
@@ -108,7 +113,7 @@ async def async_setup(hass: HomeAssistant, config: ConfigType) -> bool:
         "shell",
         async_shell,
         schema=vol.Schema({
-            vol.Required("serial"): vol.All(cv.string, vol.Length(min=1)),
+            vol.Optional(CONF_SERIAL): vol.All(cv.string, vol.Length(min=1)),
             vol.Required("command"): vol.All(
                 cv.string, vol.Length(min=1, max=8192),
                 vol.Match(r"[\s\S]*\S[\s\S]*"),
@@ -129,7 +134,7 @@ async def async_setup(hass: HomeAssistant, config: ConfigType) -> bool:
         "send_sms",
         async_send_sms,
         schema=vol.Schema({
-            vol.Required("serial"): vol.All(cv.string, vol.Length(min=1)),
+            vol.Optional(CONF_SERIAL): vol.All(cv.string, vol.Length(min=1)),
             vol.Required("recipient"): vol.All(cv.string, vol.Match(r"^\+?[0-9]{3,15}$")),
             vol.Required("message"): vol.All(
                 cv.string, vol.Length(min=1, max=1600),
@@ -156,7 +161,7 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
         )
     except Exception as err:
         raise ConfigEntryNotReady(f"Cannot initialize USB ADB identity: {err}") from err
-    coordinator = UsbCoordinator(hass, bridge)
+    coordinator = UsbCoordinator(hass, entry, bridge)
     await coordinator.async_config_entry_first_refresh()
     hass.data[DOMAIN] = coordinator
     await hass.config_entries.async_forward_entry_setups(entry, PLATFORMS)
