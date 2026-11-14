@@ -12,6 +12,7 @@ from homeassistant.core import Context, HomeAssistant
 from homeassistant.exceptions import HomeAssistantError, ServiceValidationError, Unauthorized, UnknownUser
 from homeassistant.helpers import device_registry as dr
 from homeassistant.helpers import entity_registry as er
+from homeassistant.helpers import issue_registry as ir
 import voluptuous as vol
 
 from custom_components.android_debug_bridge_usb.const import DOMAIN
@@ -39,7 +40,11 @@ class IntegrationTests(unittest.IsolatedAsyncioTestCase):
         await async_load_base_functionality(self.hass)
         self.bridge = Mock()
         self.bridge.devices.return_value = [PHONE]
-        self.bridge.shell.return_value = "Pixel\n"
+        self.bridge.execute.return_value = Mock(output="Pixel\n", exit_code=0)
+        self.bridge.probe.return_value = True
+        self.bridge.send_sms.return_value = {
+            "send_button": "detected", "composer_cleared": True,
+        }
         patcher = patch(
             "custom_components.android_debug_bridge_usb.Bridge",
             return_value=self.bridge,
@@ -61,9 +66,9 @@ class IntegrationTests(unittest.IsolatedAsyncioTestCase):
         self.entry = result["result"]
         return self.hass.data.get(DOMAIN)
 
-    def phone_state(self, serial="phone"):
+    def phone_state(self, serial="phone", sensor="usb_connected"):
         entity_id = er.async_get(self.hass).async_get_entity_id(
-            "binary_sensor", DOMAIN, f"{serial}_usb_connected"
+            "binary_sensor", DOMAIN, f"{serial}_{sensor}"
         )
         return self.hass.states.get(entity_id)
 
@@ -97,9 +102,6 @@ class IntegrationTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(self.phone_state("second").state, "on")
         self.assertTrue(await self.hass.config_entries.async_unload(self.entry.entry_id))
         self.assertNotIn(DOMAIN, self.hass.data)
-        self.assertFalse(self.hass.services.has_service(DOMAIN, "shell"))
-        self.assertFalse(self.hass.services.has_service(DOMAIN, "list_devices"))
-        self.assertFalse(self.hass.services.has_service(DOMAIN, "send_sms"))
         # Previously discovered phones still get offline entities after reload.
         self.bridge.devices.return_value = []
         self.assertTrue(await self.hass.config_entries.async_setup(self.entry.entry_id))
@@ -110,15 +112,17 @@ class IntegrationTests(unittest.IsolatedAsyncioTestCase):
     async def test_shell_response_validation_and_errors(self):
         await self.setup_hub()
         data = {"serial": "phone", "command": "getprop ro.product.model"}
-        self.assertEqual(await self.call("shell", data), {"output": "Pixel\n"})
-        self.bridge.shell.assert_called_once_with("phone", "getprop ro.product.model")
+        self.assertEqual(
+            await self.call("shell", data), {"output": "Pixel\n", "exit_code": 0}
+        )
+        self.bridge.execute.assert_called_once_with("phone", "getprop ro.product.model")
         for invalid in ("", " ", "x" * 8193):
             with self.subTest(command=invalid[:10]), self.assertRaises(vol.Invalid):
                 await self.call("shell", {"serial": "phone", "command": invalid})
-        self.bridge.shell.side_effect = ValueError("Device is missing")
+        self.bridge.execute.side_effect = ValueError("Device is missing")
         with self.assertRaisesRegex(ServiceValidationError, "Device is missing"):
             await self.call("shell", data)
-        self.bridge.shell.side_effect = OSError("USB disconnected")
+        self.bridge.execute.side_effect = OSError("USB disconnected")
         with self.assertLogs("custom_components.android_debug_bridge_usb", level="ERROR"):
             with self.assertRaisesRegex(HomeAssistantError, "ADB command failed"):
                 await self.call("shell", data)
@@ -148,20 +152,30 @@ class IntegrationTests(unittest.IsolatedAsyncioTestCase):
         await self.setup_hub()
         self.assertEqual(await self.call("send_sms", SMS), {
             "status": "send_button_tapped", "delivery_confirmed": False,
+            "send_button": "detected", "composer_cleared": True,
         })
         self.bridge.send_sms.assert_called_once_with(
-            "phone", "+123456789", "Internet down", 900, 1800, 3,
+            "phone", "+123456789", "Internet down", 900, 1800, 3, True,
+        )
+        without_coordinates = {
+            key: value for key, value in SMS.items() if key not in ("send_x", "send_y")
+        }
+        await self.call("send_sms", without_coordinates | {"verify_ui": False})
+        self.bridge.send_sms.assert_called_with(
+            "phone", "+123456789", "Internet down", None, None, 3, False,
         )
         for changes in [
             {"confirm_ui_risk": False},
             {"recipient": "123;reboot"},
             {"send_x": -1},
             {"send_y": 10001},
+            {"send_y": None},
             {"message": ""},
             {"wait_seconds": 11},
         ]:
+            data = {key: value for key, value in (SMS | changes).items() if value is not None}
             with self.subTest(changes=changes), self.assertRaises(vol.Invalid):
-                await self.call("send_sms", SMS | changes)
+                await self.call("send_sms", data)
         self.bridge.send_sms.side_effect = ValueError("Cannot open SMS composer")
         with self.assertRaisesRegex(ServiceValidationError, "Cannot open SMS composer"):
             await self.call("send_sms", SMS)
@@ -182,14 +196,74 @@ class IntegrationTests(unittest.IsolatedAsyncioTestCase):
         await coordinator.async_refresh()
         await self.hass.async_block_till_done()
         self.assertEqual(self.phone_state().state, "on")
-        for invalid in ([PHONE, PHONE], [{"serial": "", "port_path": []}]):
-            self.bridge.devices.return_value = invalid
-            with self.assertRaises(HomeAssistantError):
-                await self.call("list_devices")
-            self.assertFalse(coordinator.last_update_success)
+
+    async def test_untargetable_phones_are_ignored_without_hiding_others(self):
+        await self.setup_hub()
+        second = {"serial": "second", "port_path": [1, 3]}
+        self.bridge.devices.return_value = [
+            PHONE, PHONE, {"serial": "", "port_path": []},
+            {"serial": None, "port_path": None}, second,
+        ]
+        with self.assertLogs("custom_components.android_debug_bridge_usb", level="WARNING"):
+            self.assertEqual(await self.call("list_devices"), {"devices": [second]})
+        await self.hass.async_block_till_done()
+        self.assertEqual(self.phone_state("second").state, "on")
+        self.assertEqual(self.phone_state().state, "off")
+
+    async def test_adb_ready_sensor_and_repair_issue(self):
+        coordinator = await self.setup_hub()
+        issues = ir.async_get(self.hass)
+        self.assertEqual(self.phone_state(sensor="adb_ready").state, "on")
+        self.bridge.probe.reset_mock()
+        await coordinator.async_refresh()
+        self.bridge.probe.assert_not_called()
+
+        # The phone no longer trusts this host: probed again once the result is stale.
+        self.bridge.probe.return_value = False
+        with patch(
+            "custom_components.android_debug_bridge_usb.coordinator.PROBE_INTERVAL", 0
+        ):
+            await coordinator.async_refresh()
+        await self.hass.async_block_till_done()
+        self.assertEqual(self.phone_state(sensor="adb_ready").state, "off")
+        self.assertEqual(self.phone_state().state, "on")
+        self.assertIsNotNone(issues.async_get_issue(DOMAIN, "adb_unauthorized_phone"))
+
+        # Approving the prompt during an action is reflected immediately.
+        await self.call("shell", {"serial": "phone", "command": "id"})
+        await self.hass.async_block_till_done()
+        self.assertEqual(self.phone_state(sensor="adb_ready").state, "on")
+        self.assertIsNone(issues.async_get_issue(DOMAIN, "adb_unauthorized_phone"))
+
+        # A probe that cannot connect is "not ready" but not an authorization issue,
+        # and a phone that is not ready is probed on every scan.
+        self.bridge.probe.side_effect = OSError("USB busy")
+        with patch(
+            "custom_components.android_debug_bridge_usb.coordinator.PROBE_INTERVAL", 0
+        ):
+            await coordinator.async_refresh()
+        self.bridge.probe.reset_mock()
+        await coordinator.async_refresh()
+        self.bridge.probe.assert_called_once_with("phone")
+        await self.hass.async_block_till_done()
+        self.assertEqual(self.phone_state(sensor="adb_ready").state, "off")
+        self.assertIsNone(issues.async_get_issue(DOMAIN, "adb_unauthorized_phone"))
+
+        self.bridge.devices.return_value = []
+        await coordinator.async_refresh()
+        await self.hass.async_block_till_done()
+        self.assertEqual(self.phone_state(sensor="adb_ready").state, "unavailable")
 
     async def test_initial_discovery_failure_retries_setup(self):
         self.bridge.devices.side_effect = OSError("USB denied")
         await self.setup_hub()
         self.assertEqual(self.entry.state, ConfigEntryState.SETUP_RETRY)
-        self.assertFalse(self.hass.services.has_service(DOMAIN, "shell"))
+        # Actions stay registered and explain the problem instead of being unknown.
+        for service, data in [
+            ("shell", {"serial": "phone", "command": "id"}),
+            ("list_devices", {}),
+            ("send_sms", SMS),
+        ]:
+            with self.assertRaisesRegex(HomeAssistantError, "hub is not loaded"):
+                await self.call(service, data)
+        self.bridge.execute.assert_not_called()

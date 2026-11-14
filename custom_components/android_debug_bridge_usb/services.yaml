@@ -2,7 +2,8 @@ shell:
   name: Run shell command
   description: >-
     Send an Android shell command to one USB phone. Administrator access is
-    required for user-initiated calls. Returns output when a response is requested.
+    required for user-initiated calls. Returns output and exit_code when a
+    response is requested.
   fields:
     serial:
       name: Serial
@@ -27,9 +28,10 @@ list_devices:
 send_sms:
   name: Attempt SMS using the phone UI
   description: >-
-    Wake the phone, open a prefilled SMS composer, wait, and tap calibrated Send
-    coordinates once. Requires an unlocked phone and a configured SMS app/SIM.
-    Does not confirm sending or delivery. Test on your phone before automating.
+    Wake the phone, open a prefilled SMS composer, check on screen that it holds
+    exactly this message (clearing a leftover draft first), tap Send once, and
+    check that the composer emptied. Requires an unlocked phone and a configured
+    SMS app/SIM. Does not confirm delivery. Test on your phone before automating.
   fields:
     serial:
       name: Serial
@@ -50,7 +52,9 @@ send_sms:
           multiline: true
     send_x:
       name: Send button X coordinate
-      required: true
+      description: >-
+        Fallback used when the Send button cannot be identified on screen; it
+        must then point at a button of the SMS app. Required if Verify screen is off.
       selector:
         number:
           min: 0
@@ -58,7 +62,7 @@ send_sms:
           mode: box
     send_y:
       name: Send button Y coordinate
-      required: true
+      description: Provide together with the X coordinate.
       selector:
         number:
           min: 0
@@ -72,11 +76,19 @@ send_sms:
           min: 1
           max: 10
           mode: box
+    verify_ui:
+      name: Verify screen
+      description: >-
+        Read the screen before and after tapping. Turn off only if screen reading
+        does not work on your phone: the coordinates are then tapped blindly.
+      default: true
+      selector:
+        boolean:
     confirm_ui_risk:
       name: Accept UI automation risk
       description: >-
-        Must be enabled. Coordinates can tap the wrong control if the UI changes.
-        A tap does not confirm SMS sending or delivery. Never retry blindly.
+        Must be enabled. UI automation can tap the wrong control if the UI changes.
+        A tap does not confirm SMS delivery. Never retry blindly.
       required: true
       selector:
         boolean:

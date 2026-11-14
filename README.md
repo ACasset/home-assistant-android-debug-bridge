@@ -16,7 +16,7 @@ Requires Home Assistant 2025.4.4 or later and USB access from **Home Assistant C
 3. Open **Settings → Devices & services → Add integration** and search for
    **Android Debug Bridge USB**. Confirm setup once for the host.
 4. Connect a phone with USB debugging enabled. Discovery runs every 30 seconds.
-   Each phone gets a device and a **USB connected** binary sensor.
+   Each phone gets a device with **USB connected** and **ADB ready** binary sensors.
 
 For manual installation, copy `custom_components/android_debug_bridge_usb` into
 your configuration directory's `custom_components` folder and restart.
@@ -38,17 +38,36 @@ your configuration directory's `custom_components` folder and restart.
    `getprop ro.product.model`. Unlock the phone and accept **Allow USB debugging?**.
    If authorization times out, approve and retry.
 
-The connection sensor reports USB presence, not ADB authorization. Disconnected
-phones turn off; enumeration failures make sensors unavailable. Phones with missing
-or duplicate serials are rejected rather than targeted ambiguously.
+**USB connected** reports USB presence, not ADB authorization. Disconnected
+phones turn off; enumeration failures make sensors unavailable. A phone whose
+serial is unreadable or shared with another connected phone is ignored (with a
+warning in the logs) rather than targeted ambiguously; other phones keep working.
+
+**ADB ready** (diagnostic) is on when the connected phone trusts this host and
+answers a harmless `echo`. It is checked when the phone appears, then every five
+minutes, and on every scan while it is off. The check never opens the
+authorization prompt on the phone. If the phone no longer trusts the host (for
+example after an Android update or **Revoke USB debugging authorizations**), a
+repair issue appears under **Settings → Repairs**; run the `shell` action and
+accept the prompt to fix it. Use this sensor in an automation to be warned
+*before* you need the phone.
 
 ## Actions
+
+Actions are registered when the integration loads, even if USB access is broken
+at that moment: they then fail with "The USB ADB hub is not loaded" instead of
+being unknown to your automations.
 
 `android_debug_bridge_usb.list_devices` refreshes discovery immediately and
 returns `{"devices": [{"serial": "ABC123", "port_path": [1, 2]}]}`.
 
 `android_debug_bridge_usb.shell` accepts an exact `serial` and a `command`
-(1-8192 characters, without `adb shell`). It optionally returns `{"output": "..."}`.
+(1-8192 characters, without `adb shell`). It optionally returns
+`{"output": "...", "exit_code": 0}`. `exit_code` is the Android exit status of
+the command (0 means success), or `null` if the phone did not report it. The
+action does not fail on a nonzero status; test it in your automation, for
+example `{{ phone_result.exit_code == 0 }}`. To report the status, the command
+runs in a subshell.
 For example, in a script:
 
 ```yaml
@@ -79,40 +98,60 @@ response, even when Android has applied the change.
 For these two standalone commands only, a transport error triggers up to five
 reconnection checks with `svc usb getFunctions`, separated by one second.
 The command is **never resent**. If the reported mode matches (ignoring the ADB
-function), the action returns `{"output": ""}` and logs the recovery. Otherwise,
+function), the action returns `{"output": "", "exit_code": null}` and logs the recovery. Otherwise,
 it reports an unconfirmed outcome: check the phone before retrying. Keep USB
 debugging enabled and ensure VM/container USB access survives re-enumeration.
 Compound shell commands and other commands retain normal error handling.
 
 ### SMS alerts when internet is lost
 
-`android_debug_bridge_usb.send_sms` uses `ACTION_SENDTO` to open a message and
-then `input tap X Y` to press Send once. It uses USB locally, not the internet.
-**It is UI automation, not a reliable SMS API or delivery receipt.** It returns
-`{"status": "send_button_tapped", "delivery_confirmed": false}`. A wrong screen,
-dialog, locked phone, or changed layout can prevent sending or tap something else.
-Do not use it as the sole channel for critical alerts.
+`android_debug_bridge_usb.send_sms` drives the phone's SMS app over USB, not the
+internet. **It is UI automation, not a reliable SMS API or delivery receipt.**
+Do not use it as the sole channel for critical alerts. Each attempt:
+
+1. Wakes the screen, dismisses a swipe-only lock screen, and checks the screen is on.
+2. Opens the SMS app on a fresh composer (`ACTION_SENDTO`) with your message.
+3. Reads the screen (`uiautomator dump`) and requires a text field of the SMS app
+   holding **exactly** your message. If it holds something else, such as a draft
+   left by an earlier failed attempt, that text is deleted and the composer is
+   reopened once. If the message still is not there (wrong screen, dialog, app
+   chooser, or an app that ignores prefilled text), it stops: nothing is tapped.
+4. Taps Send once. The button is located on screen by its identifier; if it
+   cannot be identified, `send_x`/`send_y` are used, but only if they point at a
+   button of the SMS app. Otherwise it stops without tapping.
+5. Reads the screen again. If your message is still in the composer, the action
+   fails with "probably not sent".
+
+It returns `{"status": "send_button_tapped", "delivery_confirmed": false,
+"send_button": "detected", "composer_cleared": true}`. `send_button` is
+`detected` or `coordinates`; `composer_cleared` is `true` when the message left
+the composer, or `null` if the screen could not be re-read after the tap.
+Neither proves that the network accepted or delivered the SMS.
+
+If screen reading does not work on your phone, set `verify_ui: false` to tap
+`send_x`/`send_y` blindly after the wait, without any of the checks above.
 
 Prepare a dedicated phone:
 
 1. Insert an active SIM with SMS service and cellular coverage. Choose the default
    SMS app and SIM, dismiss initial dialogs, and disable RCS/chat for this workflow.
    Carrier charges and multipart SMS charges may apply.
-2. Keep the phone powered, USB debugging authorized, and the screen unlocked.
-   The action wakes the screen but **does not bypass a lock screen**. Leaving a
-   phone unlocked has security implications; restrict physical access.
-3. Open a test message with the same SMS app. Enable Android Developer options'
-   **Pointer location** to find the Send button's X/Y pixel coordinates.
-   Keep orientation, display scale, keyboard state, and app layout consistent.
-4. Test `send_sms` manually with your own number. Set `send_x`, `send_y`, and
-   `confirm_ui_risk: true`; increase `wait_seconds` (1-10, default 3) if needed.
+2. Keep the phone powered, USB debugging authorized, and without a PIN, pattern
+   or password: the action **does not bypass a secure lock screen**. A phone
+   without a lock has security implications; restrict physical access.
+3. Test `send_sms` manually with your own number and `confirm_ui_risk: true`,
+   first without coordinates. If it reports that the Send button cannot be
+   identified, open a test message, enable Android Developer options'
+   **Pointer location** to find the button's X/Y pixel coordinates, and pass them
+   as `send_x` and `send_y`. Increase `wait_seconds` (1-10, default 3) if the
+   composer is slow to open.
    Verify the recipient, message, actual SMS receipt, and behavior after sleep.
-   Some SMS apps ignore the prefilled body: do not automate unless yours works.
-5. Test again with the regular internet disconnected and Wi-Fi off on the phone.
+4. Test again with the regular internet disconnected and Wi-Fi off on the phone.
    ADB still works over USB; cellular SMS service must remain available.
 
 Example automation, using an **existing internet-connectivity binary sensor**
-(replace its entity ID, phone serial, recipient, and coordinates):
+(replace its entity ID, phone serial and recipient; `send_x`/`send_y` are only
+needed if your Send button is not identified automatically):
 
 ```yaml
 alias: SMS when internet is lost
@@ -142,8 +181,8 @@ integration against an external host; a single host can fail independently of
 your internet connection). The example sends once per on-to-off transition after
 two minutes, not periodically. It does not fire solely because Home Assistant
 starts while offline. No automatic retries are performed: check the phone before
-retrying to avoid duplicate SMS. Neither command output nor a tap proves sending,
-recipient correctness, or delivery. For reliable unattended SMS, prefer an Android
+retrying to avoid duplicate SMS. Neither command output, a tap, nor an emptied
+composer proves recipient correctness or delivery. For reliable unattended SMS, prefer an Android
 app with SMS permission or a supported cellular modem.
 
 ## Security and troubleshooting
@@ -160,7 +199,8 @@ those two files manually while the integration is unloaded to reset its identity
 
 Operations are serialized and connections close after each command. Commands have
 a 60-second timeout and a 1 MiB output limit (the library buffers output before
-this check). Successful completion does not guarantee Android exit status zero.
+this check). The action succeeds even when the Android exit status is nonzero;
+check `exit_code`.
 This is a text shell interface: desktop `adb install`, `adb push`, file transfers,
 interactive terminals, and binary output are not supported.
 
@@ -188,3 +228,6 @@ python -m unittest discover -s tests -v
 
 The tests mock USB hardware. Real USB enumeration and Android authorization must
 also be verified on the Home Assistant host with a connected phone.
+
+GitHub Actions runs these tests, Home Assistant's `hassfest` and the HACS
+validation on every pull request, on pushes to `main`, and weekly.

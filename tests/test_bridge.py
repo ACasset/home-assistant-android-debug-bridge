@@ -2,10 +2,12 @@
 
 import importlib.util
 from pathlib import Path
+import re
 import shlex
 import tempfile
 import unittest
-from unittest.mock import Mock, patch
+from unittest.mock import Mock, PropertyMock, patch
+from xml.sax.saxutils import quoteattr
 
 # Load the standalone USB boundary without importing Home Assistant.
 spec = importlib.util.spec_from_file_location(
@@ -15,6 +17,80 @@ spec = importlib.util.spec_from_file_location(
 )
 bridge = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(bridge)
+
+WRAPPED = re.compile(r'\(\n(.*)\n\)\necho "(__adb_usb_exit_[0-9a-f]{16}__:)\$\?"', re.DOTALL)
+PHONE = {"serial": "phone", "port_path": [1, 2]}
+
+
+def sent(call):
+    """Return the user's command from the wrapper that reports its exit status."""
+    return WRAPPED.fullmatch(call.args[0])[1]
+
+
+class FakePhone:
+    """Stand-in for Bridge.execute that models an SMS composer screen."""
+
+    FIELD = (0, 1700, 800, 1900)
+    SEND = (850, 1750, 1050, 1850)
+
+    def __init__(
+        self, draft="", send_id="com.sms:id/send_button", prefill=True, sends=True,
+        awake=True, dump_ok=True, package="com.sms",
+    ):
+        self.text = draft
+        self.send_id = send_id
+        self.prefill = prefill
+        self.sends = sends
+        self.awake = awake
+        self.dump_ok = dump_ok
+        self.package = package
+        self.commands = []
+        self.taps = []
+        self.sent = []
+
+    def node(self, cls, bounds, text="", resource_id="", clickable=True):
+        return (
+            f"<node class={quoteattr(cls)} package={quoteattr(self.package)} "
+            f"text={quoteattr(text)} resource-id={quoteattr(resource_id)} "
+            f'clickable="{str(clickable).lower()}" enabled="true" '
+            f'bounds="[{bounds[0]},{bounds[1]}][{bounds[2]},{bounds[3]}]" />'
+        )
+
+    def __call__(self, serial, command):
+        self.commands.append(command)
+        output, code = "", 0
+        if command.startswith("am start"):
+            if self.prefill and not self.text:
+                self.text = shlex.split(command)[-1]
+            output = "Starting: Intent\nStatus: ok\nActivity: com.sms/.Compose\n"
+        elif command.startswith("rm -f /data/local/tmp/adb_usb_window.xml; uiautomator"):
+            # Like the real tool, a failed dump prints nothing and still exits 0.
+            if self.dump_ok:
+                output = (
+                    "<?xml version='1.0' encoding='UTF-8' standalone='yes' ?>"
+                    '<hierarchy rotation="0">'
+                    + self.node("android.widget.FrameLayout", (0, 0, 1080, 1920), clickable=False)
+                    + self.node("android.widget.ImageButton", (0, 1600, 100, 1700))
+                    + self.node("android.widget.EditText", self.FIELD, self.text)
+                    + self.node("android.widget.ImageButton", self.SEND, resource_id=self.send_id)
+                    + "</hierarchy>"
+                )
+        elif command.startswith("input tap"):
+            x, y = (int(value) for value in command.split()[2:])
+            self.taps.append((x, y))
+            left, top, right, bottom = self.SEND
+            if left <= x < right and top <= y < bottom and self.sends:
+                self.sent.append(self.text)
+                self.text = ""
+        elif command == "input keyevent KEYCODE_WAKEUP":
+            pass
+        elif command.startswith("input keyevent"):
+            self.text = self.text[: -command.split().count("67")]
+        elif "mWakefulness" in command:
+            output = f"  mWakefulness={'Awake' if self.awake else 'Asleep'}\n"
+        else:
+            raise AssertionError(f"Unexpected command: {command}")
+        return bridge.ShellResult(output, code)
 
 
 class BridgeTests(unittest.TestCase):
@@ -36,10 +112,55 @@ class BridgeTests(unittest.TestCase):
         self.assertTrue(key.with_suffix(".pub").exists())
 
     def test_enumeration(self):
+        unreadable = Mock(port_path=[1, 3])
+        type(unreadable).serial_number = PropertyMock(side_effect=OSError("denied"))
         with patch.object(self.bridge.usb_transport, "find_all_adb_devices") as devices:
-            devices.return_value = [Mock(serial_number="phone", port_path=[1, 2])]
+            devices.return_value = [
+                unreadable, Mock(serial_number="phone", port_path=[1, 2]),
+            ]
+            self.assertEqual(self.bridge.devices(), [
+                {"serial": None, "port_path": None},
+                {"serial": "phone", "port_path": [1, 2]},
+            ])
+
+    def test_probe_reports_authorization_without_offering_the_key(self):
+        device = self.usb.return_value
+        device.shell.return_value = b"ok\r\n"
+        patcher = patch.object(self.bridge, "_devices", return_value=[PHONE])
+        patcher.start()
+        self.addCleanup(patcher.stop)
+        self.assertIs(self.bridge.probe("phone"), True)
+        self.usb.assert_called_once_with(port_path=[1, 2], default_transport_timeout_s=5.0)
+        signer = device.connect.call_args.kwargs["rsa_keys"][0]
+        self.assertEqual(signer.Sign(b"x" * 20), self.bridge.signer.Sign(b"x" * 20))
+        # adb-shell asks for the public key only once the phone rejected the signature.
+        device.connect.side_effect = lambda rsa_keys, **kwargs: rsa_keys[0].GetPublicKey()
+        self.assertIs(self.bridge.probe("phone"), False)
+        device.connect.side_effect = bridge.exceptions.UsbReadFailedError("gone", OSError())
+        with self.assertRaises(bridge.exceptions.UsbReadFailedError):
+            self.bridge.probe("phone")
+        self.assertEqual(device.close.call_count, 3)
+
+    def test_exit_code_is_reported_and_removed_from_output(self):
+        device = self.usb.return_value
+        for output, code, expected in [
+            (b"", "0", ""), (b"not found\r\n", "127", "not found\r\n"), (b"no newline", "3", "no newline"),
+        ]:
+            device.shell.side_effect = lambda command, **kwargs: (
+                output + WRAPPED.fullmatch(command)[2].encode() + code.encode() + b"\r\n"
+            )
+            with (
+                self.subTest(code=code),
+                patch.object(self.bridge, "_devices", return_value=[PHONE]),
+            ):
+                self.assertEqual(self.bridge.execute("phone", "id"), (expected, int(code)))
+        # A guessed marker printed by the command itself is not trusted.
+        device.shell.side_effect = None
+        device.shell.return_value = b"__adb_usb_exit_0000000000000000__:0\n"
+        with patch.object(self.bridge, "_devices", return_value=[PHONE]):
             self.assertEqual(
-                self.bridge.devices(), [{"serial": "phone", "port_path": [1, 2]}]
+                self.bridge.execute("phone", "id"),
+                ("__adb_usb_exit_0000000000000000__:0\n", None),
             )
 
     def test_invalid_requests_do_not_open_device(self):
@@ -61,17 +182,22 @@ class BridgeTests(unittest.TestCase):
     def test_shell_targets_selected_device_and_closes(self):
         usb = self.usb
         usb.return_value.shell.return_value = b"Pixel\n"
-        with patch.object(self.bridge, "_devices", return_value=[{"serial": "phone"}]):
+        other = {"serial": "other", "port_path": [1, 3]}
+        with patch.object(self.bridge, "_devices", return_value=[other, PHONE]):
             self.assertEqual(self.bridge.shell("phone", "getprop ro.product.model"), "Pixel\n")
-        usb.assert_called_once_with(serial="phone", default_transport_timeout_s=5.0)
-        usb.return_value.shell.assert_called_once_with(
-            "getprop ro.product.model", read_timeout_s=30.0, timeout_s=60.0, decode=False
+        # Opened by port: selecting by serial would re-read every phone's serial.
+        usb.assert_called_once_with(port_path=[1, 2], default_transport_timeout_s=5.0)
+        usb.return_value.shell.assert_called_once()
+        self.assertEqual(sent(usb.return_value.shell.call_args), "getprop ro.product.model")
+        self.assertEqual(
+            usb.return_value.shell.call_args.kwargs,
+            {"read_timeout_s": 30.0, "timeout_s": 60.0, "decode": False},
         )
         usb.return_value.close.assert_called_once()
 
     def test_failures_close_connection(self):
         usb = self.usb
-        with patch.object(self.bridge, "_devices", return_value=[{"serial": "phone"}]):
+        with patch.object(self.bridge, "_devices", return_value=[PHONE]):
             usb.return_value.connect.return_value = False
             with self.assertRaises(ValueError):
                 self.bridge.shell("phone", "id")
@@ -84,7 +210,7 @@ class BridgeTests(unittest.TestCase):
 
     def test_output_limits_and_decoding(self):
         usb = self.usb
-        with patch.object(self.bridge, "_devices", return_value=[{"serial": "phone"}]):
+        with patch.object(self.bridge, "_devices", return_value=[PHONE]):
             usb.return_value.shell.return_value = b"x" * bridge.MAX_OUTPUT
             self.assertEqual(len(self.bridge.shell("phone", "id")), bridge.MAX_OUTPUT)
             usb.return_value.shell.return_value = b"x" * (bridge.MAX_OUTPUT + 1)
@@ -98,7 +224,7 @@ class BridgeTests(unittest.TestCase):
         device = self.usb.return_value
         device.shell.return_value = b"Permission denied\n"
         with (
-            patch.object(self.bridge, "_devices", return_value=[{"serial": "phone"}]),
+            patch.object(self.bridge, "_devices", return_value=[PHONE]),
             patch.object(bridge.time, "sleep") as sleep,
         ):
             self.assertEqual(
@@ -120,7 +246,7 @@ class BridgeTests(unittest.TestCase):
             for error_class in bridge._TRANSPORT_ERRORS:
                 with (
                     self.subTest(command=command, output=output, error=error_class),
-                    patch.object(self.bridge, "_devices", return_value=[{"serial": "phone"}]),
+                    patch.object(self.bridge, "_devices", return_value=[PHONE]),
                     patch.object(bridge.time, "sleep") as sleep,
                     self.assertLogs("bridge", level="WARNING"),
                 ):
@@ -139,7 +265,7 @@ class BridgeTests(unittest.TestCase):
                     device.connect.side_effect = connect
                     self.assertEqual(self.bridge.shell("phone", command), "")
                     self.assertEqual(
-                        [call.args[0] for call in device.shell.call_args_list],
+                        [sent(call) for call in device.shell.call_args_list],
                         [command, "svc usb getFunctions"],
                     )
                     self.assertEqual(device.close.call_count, 2)
@@ -155,8 +281,8 @@ class BridgeTests(unittest.TestCase):
         ]
         with (
             patch.object(self.bridge, "_devices", side_effect=[
-                [{"serial": "phone"}], [], [{"serial": "phone"}],
-                [{"serial": "phone"}], [{"serial": "phone"}],
+                [PHONE], [], [PHONE],
+                [PHONE], [PHONE],
             ]),
             patch.object(bridge.time, "sleep") as sleep,
             self.assertLogs("bridge", level="WARNING"),
@@ -164,7 +290,7 @@ class BridgeTests(unittest.TestCase):
             self.assertEqual(self.bridge.shell("phone", "svc usb setFunctions rndis"), "")
         self.assertEqual(sleep.call_count, 4)
         self.assertEqual(
-            [call.args[0] for call in device.shell.call_args_list],
+            [sent(call) for call in device.shell.call_args_list],
             ["svc usb setFunctions rndis"] + ["svc usb getFunctions"] * 3,
         )
         self.assertEqual(device.close.call_count, 4)
@@ -178,7 +304,7 @@ class BridgeTests(unittest.TestCase):
         ]:
             with (
                 self.subTest(expected=expected, output=output),
-                patch.object(self.bridge, "_devices", return_value=[{"serial": "phone"}]),
+                patch.object(self.bridge, "_devices", return_value=[PHONE]),
                 patch.object(bridge.time, "sleep") as sleep,
                 self.assertLogs("bridge", level="WARNING"),
             ):
@@ -198,7 +324,7 @@ class BridgeTests(unittest.TestCase):
         self.usb.return_value.shell.side_effect = error
         with (
             patch.object(self.bridge, "_devices", side_effect=[
-                [{"serial": "phone"}], [], [], [], [], [],
+                [PHONE], [], [], [], [], [],
             ]),
             patch.object(bridge.time, "sleep") as sleep,
             self.assertLogs("bridge", level="WARNING"),
@@ -217,7 +343,7 @@ class BridgeTests(unittest.TestCase):
         ]:
             with (
                 self.subTest(command=command),
-                patch.object(self.bridge, "_devices", return_value=[{"serial": "phone"}]),
+                patch.object(self.bridge, "_devices", return_value=[PHONE]),
                 patch.object(bridge.time, "sleep") as sleep,
             ):
                 self.usb.reset_mock()
@@ -236,7 +362,7 @@ class BridgeTests(unittest.TestCase):
         ]:
             with (
                 self.subTest(phase=phase),
-                patch.object(self.bridge, "_devices", return_value=[{"serial": "phone"}]),
+                patch.object(self.bridge, "_devices", return_value=[PHONE]),
                 patch.object(bridge.time, "sleep") as sleep,
             ):
                 self.usb.return_value.reset_mock(side_effect=True)
@@ -246,28 +372,82 @@ class BridgeTests(unittest.TestCase):
                 self.usb.return_value.close.assert_called_once()
                 sleep.assert_not_called()
 
-    def test_sms_quotes_message_and_orders_steps(self):
-        message = "Internet down! 'hello'; $(touch /tmp/not-executed)\nPlease check."
+    def send(self, phone, message="Outage", **overrides):
         with (
-            patch.object(self.bridge, "shell", side_effect=["", "Status: ok\n", ""]) as shell,
-            patch.object(bridge.time, "sleep") as sleep,
+            patch.object(self.bridge, "execute", side_effect=phone),
+            patch.object(bridge.time, "sleep"),
         ):
-            self.bridge.send_sms("phone", "+123456789", message, 900, 1800, 3)
-        self.assertEqual(shell.call_args_list[0].args, ("phone", "input keyevent KEYCODE_WAKEUP"))
-        args = shlex.split(shell.call_args_list[1].args[1])
-        self.assertEqual(args, [
-            "am", "start", "-W", "-a", "android.intent.action.SENDTO",
+            return self.bridge.send_sms("phone", "+123456789", message, **overrides)
+
+    def test_sms_quotes_message_and_taps_detected_button(self):
+        message = "Panne internet ! 'hello'; $(touch /tmp/not-executed)\n<Vérifiez> & \"é\""
+        phone = FakePhone()
+        self.assertEqual(
+            self.send(phone, message, wait_seconds=4),
+            {"send_button": "detected", "composer_cleared": True},
+        )
+        self.assertEqual(phone.commands[0], "input keyevent KEYCODE_WAKEUP")
+        self.assertEqual(shlex.split(phone.commands[2]), [
+            "am", "start", "-W", "--activity-clear-task",
+            "-a", "android.intent.action.SENDTO",
             "-d", "smsto:+123456789", "--es", "sms_body", message,
         ])
-        self.assertEqual(shell.call_args_list[2].args, ("phone", "input tap 900 1800"))
-        sleep.assert_called_once_with(3)
+        self.assertEqual(phone.sent, [message])
+        self.assertEqual(phone.taps, [(950, 1800)])
+
+    def test_sms_clears_leftover_draft_before_sending(self):
+        phone = FakePhone(draft="old unsent text")
+        with self.assertLogs("bridge", level="WARNING"):
+            result = self.send(phone)
+        self.assertEqual(result["composer_cleared"], True)
+        self.assertEqual(phone.sent, ["Outage"])
+        keys = [c for c in phone.commands if c.startswith("input keyevent 67")]
+        self.assertEqual(keys[0].split()[2:], ["67"] * 15 + ["112"] * 15)
+        self.assertEqual(phone.taps[0], (400, 1800))
+
+    def test_sms_coordinates_are_a_verified_fallback(self):
+        self.assertEqual(
+            self.send(FakePhone(send_id=""), send_x=900, send_y=1800),
+            {"send_button": "coordinates", "composer_cleared": True},
+        )
+        for coordinates in [{}, {"send_x": 500, "send_y": 500}, {"send_x": 400, "send_y": 1800}]:
+            phone = FakePhone(send_id="")
+            with self.subTest(coordinates=coordinates), self.assertRaisesRegex(ValueError, "Nothing was sent"):
+                self.send(phone, **coordinates)
+            self.assertEqual(phone.taps, [])
+
+    def test_sms_aborts_without_tapping_when_screen_is_not_as_expected(self):
+        for phone in [
+            FakePhone(prefill=False),
+            FakePhone(dump_ok=False),
+            FakePhone(awake=False),
+            FakePhone(package="com.android.systemui"),
+            FakePhone(draft="x" * 2001),
+        ]:
+            with self.subTest(phone=vars(phone)), self.assertRaisesRegex(ValueError, "Nothing was sent"):
+                self.send(phone, send_x=900, send_y=1800)
+            self.assertEqual(phone.taps, [])
+
+    def test_sms_reports_message_left_in_composer(self):
+        phone = FakePhone(sends=False)
+        with self.assertRaisesRegex(ValueError, "still in the composer"):
+            self.send(phone)
+        self.assertEqual(len(phone.taps), 1)
+
+    def test_sms_without_ui_verification_taps_coordinates_blindly(self):
+        phone = FakePhone(prefill=False)
+        self.assertEqual(
+            self.send(phone, send_x=900, send_y=1800, verify_ui=False),
+            {"send_button": "coordinates", "composer_cleared": None},
+        )
+        self.assertEqual(phone.taps, [(900, 1800)])
+        self.assertFalse(any("uiautomator" in c for c in phone.commands))
 
     def test_sms_failure_does_not_tap_or_retry(self):
         for responses in [
             ["Error: permission denied"],
-            ["", "Error: no activity found"],
-            ["", "Status: timeout"],
-            ["", "Status: ok\n", "Error: invalid input"],
+            ["", "", "Error: no activity found"],
+            ["", "", "Status: timeout"],
         ]:
             with (
                 self.subTest(responses=responses),
@@ -289,6 +469,8 @@ class BridgeTests(unittest.TestCase):
             {"send_y": 10001},
             {"wait_seconds": 0},
             {"wait_seconds": 11},
+            {"send_x": None},
+            {"send_x": None, "send_y": None, "verify_ui": False},
         ]:
             data = dict(
                 serial="phone", recipient="+123456789", message="Outage",
