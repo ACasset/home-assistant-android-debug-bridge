@@ -64,8 +64,9 @@ async def async_setup(hass: HomeAssistant, config: ConfigType) -> bool:
         except Exception as err:
             _LOGGER.exception("USB ADB command failed")
             raise HomeAssistantError(
-                "ADB command failed. Check USB access, unlock the phone, approve "
-                "USB debugging, and check the Home Assistant logs."
+                f"ADB command failed ({type(err).__name__}: {err}). Check USB "
+                "access, unlock the phone, approve USB debugging, and check the "
+                "Home Assistant logs."
             ) from err
         coordinator.async_command_succeeded(serial)
         return {"output": result.output, "exit_code": result.exit_code}
@@ -96,7 +97,8 @@ async def async_setup(hass: HomeAssistant, config: ConfigType) -> bool:
         except Exception as err:
             _LOGGER.exception("USB ADB SMS attempt failed; do not retry blindly")
             raise HomeAssistantError(
-                "SMS attempt failed. Check the phone before retrying to avoid duplicates."
+                f"SMS attempt failed ({type(err).__name__}: {err}). Check the phone "
+                "before retrying to avoid duplicates."
             ) from err
         coordinator.async_command_succeeded(serial)
         return {"status": "send_button_tapped", "delivery_confirmed": False, **details}

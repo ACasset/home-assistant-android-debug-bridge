@@ -181,7 +181,7 @@ class IntegrationTests(unittest.IsolatedAsyncioTestCase):
             await self.call("send_sms", SMS)
         self.bridge.send_sms.side_effect = OSError("Disconnected")
         with self.assertLogs("custom_components.android_debug_bridge_usb", level="ERROR"):
-            with self.assertRaisesRegex(HomeAssistantError, "avoid duplicates"):
+            with self.assertRaisesRegex(HomeAssistantError, "OSError: Disconnected.*avoid duplicates"):
                 await self.call("send_sms", SMS)
 
     async def test_enumeration_error_unavailable_and_recovery(self):

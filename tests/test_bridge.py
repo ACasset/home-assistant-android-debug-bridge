@@ -191,7 +191,10 @@ class BridgeTests(unittest.TestCase):
         self.assertEqual(sent(usb.return_value.shell.call_args), "getprop ro.product.model")
         self.assertEqual(
             usb.return_value.shell.call_args.kwargs,
-            {"read_timeout_s": 30.0, "timeout_s": 60.0, "decode": False},
+            {
+                "transport_timeout_s": 30.0, "read_timeout_s": 30.0,
+                "timeout_s": 60.0, "decode": False,
+            },
         )
         usb.return_value.close.assert_called_once()
 
@@ -449,14 +452,61 @@ class BridgeTests(unittest.TestCase):
             ["", "", "Error: no activity found"],
             ["", "", "Status: timeout"],
         ]:
+            results = [bridge.ShellResult(output, 0) for output in responses]
             with (
                 self.subTest(responses=responses),
-                patch.object(self.bridge, "shell", side_effect=responses) as shell,
+                patch.object(self.bridge, "execute", side_effect=results) as shell,
                 patch.object(bridge.time, "sleep"),
             ):
                 with self.assertRaises(ValueError):
                     self.bridge.send_sms("phone", "+123456789", "Outage", 900, 1800, 3)
                 self.assertEqual(shell.call_count, len(responses))
+
+    def test_sms_usb_failures_are_retried_only_when_nothing_can_be_sent(self):
+        error = bridge.exceptions.UsbReadFailedError("timeout", OSError())
+
+        def flaky(phone, match, failures):
+            def execute(serial, command):
+                if match in command and failures:
+                    failures.pop()
+                    raise error
+                return phone(serial, command)
+            return execute
+
+        # Before the tap, each step is retried; persistent failure sends nothing.
+        for match in ["KEYCODE_WAKEUP", "am start", "uiautomator"]:
+            phone = FakePhone()
+            with self.subTest(match=match), self.assertLogs("bridge", level="WARNING"):
+                result = self.send(flaky(phone, match, [1, 1]))
+            self.assertEqual(result["composer_cleared"], True)
+            self.assertEqual(phone.sent, ["Outage"])
+        phone = FakePhone()
+        with (
+            self.assertLogs("bridge", level="WARNING"),
+            self.assertRaisesRegex(ValueError, "UsbReadFailedError.*Nothing was sent"),
+        ):
+            self.send(flaky(phone, "am start", [1] * 10))
+        self.assertEqual(phone.taps, [])
+
+        # The tap on Send is never repeated.
+        phone = FakePhone()
+        failures = [1]
+        with self.assertRaisesRegex(ValueError, "may or may not have been sent"):
+            self.send(flaky(phone, "input tap", failures))
+        self.assertEqual((failures, phone.taps), ([], []))
+
+        # After the tap, an unreadable screen is an unconfirmed attempt, not an error.
+        phone = FakePhone()
+
+        def after_tap(serial, command):
+            if phone.taps and "uiautomator" in command:
+                raise error
+            return phone(serial, command)
+
+        with self.assertLogs("bridge", level="WARNING"):
+            result = self.send(after_tap)
+        self.assertEqual(result, {"send_button": "detected", "composer_cleared": None})
+        self.assertEqual(phone.sent, ["Outage"])
 
     def test_sms_invalid_inputs_never_touch_phone(self):
         for overrides in [
@@ -477,7 +527,7 @@ class BridgeTests(unittest.TestCase):
                 send_x=900, send_y=1800, wait_seconds=3,
             )
             data.update(overrides)
-            with self.subTest(overrides=overrides), patch.object(self.bridge, "shell") as shell:
+            with self.subTest(overrides=overrides), patch.object(self.bridge, "execute") as shell:
                 with self.assertRaises(ValueError):
                     self.bridge.send_sms(**data)
                 shell.assert_not_called()

@@ -122,6 +122,12 @@ Do not use it as the sole channel for critical alerts. Each attempt:
 5. Reads the screen again. If your message is still in the composer, the action
    fails with "probably not sent".
 
+USB communication failures are retried (up to three attempts per step) for every
+step that cannot send anything. The tap on Send is **never repeated**: if USB
+fails at that moment, the action reports that the SMS may or may not have been
+sent. Errors ending with "Nothing was sent." are safe to retry; for any other
+error, check the phone first. Action errors include the underlying cause.
+
 It returns `{"status": "send_button_tapped", "delivery_confirmed": false,
 "send_button": "detected", "composer_cleared": true}`. `send_button` is
 `detected` or `coordinates`; `composer_cleared` is `true` when the message left
@@ -198,7 +204,7 @@ Removing the integration leaves its key files intact for reinstallation; delete
 those two files manually while the integration is unloaded to reset its identity.
 
 Operations are serialized and connections close after each command. Commands have
-a 60-second timeout and a 1 MiB output limit (the library buffers output before
+a 60-second timeout (30 seconds without any output) and a 1 MiB output limit (the library buffers output before
 this check). The action succeeds even when the Android exit status is nonzero;
 check `exit_code`.
 This is a text shell interface: desktop `adb install`, `adb push`, file transfers,
