@@ -44,6 +44,10 @@ _NOTHING_SENT = "Nothing was sent."
 # `am start -W` or `uiautomator dump`.
 _SHELL_TRANSPORT_TIMEOUT = 30.0
 _SMS_STEP_ATTEMPTS = 3
+# A phone is briefly absent or unreadable while it re-enumerates on the bus.
+_FIND_ATTEMPTS = 3
+_FIND_RETRY_DELAY = 0.5
+_PROBE_COMMAND = "echo ok; getprop ro.product.model"
 
 
 class UsbDevice(TypedDict):
@@ -58,6 +62,10 @@ class ShellResult(NamedTuple):
 
     output: str
     exit_code: int | None
+
+
+class DeviceNotFoundError(ValueError):
+    """No single connected phone has the requested serial; nothing was run."""
 
 
 class _UiDumpError(ValueError):
@@ -125,6 +133,7 @@ class Bridge:
         if not key_path.with_suffix(".pub").exists():
             write_public_keyfile(str(key_path), str(key_path) + ".pub")
         self.signer = PythonRSASigner.FromRSAKeyPath(str(key_path))
+        self._identity_error: Exception | None = None
 
     def devices(self) -> list[UsbDevice]:
         with self.lock:
@@ -139,8 +148,9 @@ class Bridge:
                     "serial": transport.serial_number,
                     "port_path": transport.port_path,
                 }
-            except Exception:  # noqa: BLE001 - libusb errors vary by host
+            except Exception as err:  # noqa: BLE001 - libusb errors vary by host
                 _LOGGER.debug("Cannot read a USB device identity", exc_info=True)
+                self._identity_error = err
                 device = {"serial": None, "port_path": None}
             devices.append(device)
         return devices
@@ -151,17 +161,42 @@ class Bridge:
         Opening by port path avoids re-reading every phone's serial number, which
         would fail for all phones as soon as one of them is unreadable.
         """
-        matches = [device for device in self._devices() if device["serial"] == serial]
-        if len(matches) != 1:
-            raise ValueError("Device is missing or its serial is ambiguous. Refresh devices.")
+        for attempt in range(_FIND_ATTEMPTS):
+            if attempt:
+                time.sleep(_FIND_RETRY_DELAY)
+            self._identity_error = None
+            devices = self._devices()
+            matches = [device for device in devices if device["serial"] == serial]
+            if matches:
+                break
+        if len(matches) > 1:
+            raise DeviceNotFoundError(
+                f"{len(matches)} connected USB phones report the serial {serial!r}, "
+                "so it cannot be targeted safely. Disconnect the others."
+            )
+        if not matches:
+            others = sorted({device["serial"] for device in devices if device["serial"]})
+            message = (
+                f"No connected USB phone has the serial {serial!r}. Serials "
+                f"currently connected: {', '.join(map(repr, others)) or 'none'}."
+            )
+            unreadable = sum(1 for device in devices if not device["serial"])
+            if unreadable:
+                error = self._identity_error
+                reason = f" ({type(error).__name__}: {error})" if error else ""
+                message += (
+                    f" The serial of {unreadable} USB device(s) could not be read"
+                    f"{reason}; check the cable and Home Assistant's USB access."
+                )
+            raise DeviceNotFoundError(message)
         return self.device_class(
             port_path=matches[0]["port_path"], default_transport_timeout_s=5.0
         )
 
-    def probe(self, serial: str) -> bool:
-        """Return whether the phone answers ADB, without prompting on the phone.
+    def probe(self, serial: str) -> str | None:
+        """Return the phone's model if it answers ADB, without prompting on the phone.
 
-        False means the phone does not trust this identity; other failures raise.
+        None means the phone does not trust this identity; other failures raise.
         """
         with self.lock:
             device = self._open(serial)
@@ -172,15 +207,16 @@ class Bridge:
                     read_timeout_s=5.0,
                 )
                 output = device.shell(
-                    "echo ok", read_timeout_s=5.0, timeout_s=10.0, decode=False
+                    _PROBE_COMMAND, read_timeout_s=5.0, timeout_s=10.0, decode=False
                 )
             except _ProbeUnauthorized:
-                return False
+                return None
             finally:
                 device.close()
-        if output.strip() != b"ok":
+        answer, _, model = output.decode("utf-8", errors="replace").partition("\n")
+        if answer.strip() != "ok":
             raise ValueError("Unexpected ADB probe response.")
-        return True
+        return model.strip()
 
     def shell(self, serial: str, command: str) -> str:
         return self.execute(serial, command).output
@@ -355,15 +391,18 @@ class Bridge:
                 time.sleep(1)
             try:
                 return self.execute(serial, command).output
+            except DeviceNotFoundError as err:
+                # Typically the phone re-enumerating after a failed attempt.
+                error = err
             except (ValueError, exceptions.DeviceAuthError):
                 raise
             except Exception as err:  # noqa: BLE001 - libusb errors vary by host
                 error = err
-                _LOGGER.warning(
-                    "USB communication failed during an SMS step (attempt %d of %d): "
-                    "%s: %s",
-                    attempt + 1, _SMS_STEP_ATTEMPTS, type(err).__name__, err,
-                )
+            _LOGGER.warning(
+                "USB communication failed during an SMS step (attempt %d of %d): "
+                "%s: %s",
+                attempt + 1, _SMS_STEP_ATTEMPTS, type(error).__name__, error,
+            )
         raise _UsbFailure(
             "USB communication with the phone failed "
             f"({type(error).__name__}: {error})."
@@ -373,6 +412,8 @@ class Bridge:
         """Tap Send exactly once; a failure here leaves the outcome unknown."""
         try:
             self._tap(serial, x, y)
+        except DeviceNotFoundError as err:
+            raise ValueError(f"{err} {_NOTHING_SENT}") from err
         except (ValueError, exceptions.DeviceAuthError):
             raise
         except Exception as err:  # noqa: BLE001 - libusb errors vary by host

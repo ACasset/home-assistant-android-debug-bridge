@@ -125,17 +125,17 @@ class BridgeTests(unittest.TestCase):
 
     def test_probe_reports_authorization_without_offering_the_key(self):
         device = self.usb.return_value
-        device.shell.return_value = b"ok\r\n"
+        device.shell.return_value = b"ok\r\nPixel 7\r\n"
         patcher = patch.object(self.bridge, "_devices", return_value=[PHONE])
         patcher.start()
         self.addCleanup(patcher.stop)
-        self.assertIs(self.bridge.probe("phone"), True)
+        self.assertEqual(self.bridge.probe("phone"), "Pixel 7")
         self.usb.assert_called_once_with(port_path=[1, 2], default_transport_timeout_s=5.0)
         signer = device.connect.call_args.kwargs["rsa_keys"][0]
         self.assertEqual(signer.Sign(b"x" * 20), self.bridge.signer.Sign(b"x" * 20))
         # adb-shell asks for the public key only once the phone rejected the signature.
         device.connect.side_effect = lambda rsa_keys, **kwargs: rsa_keys[0].GetPublicKey()
-        self.assertIs(self.bridge.probe("phone"), False)
+        self.assertIsNone(self.bridge.probe("phone"))
         device.connect.side_effect = bridge.exceptions.UsbReadFailedError("gone", OSError())
         with self.assertRaises(bridge.exceptions.UsbReadFailedError):
             self.bridge.probe("phone")
@@ -173,11 +173,38 @@ class BridgeTests(unittest.TestCase):
         self.usb.assert_not_called()
 
     def test_missing_or_ambiguous_device_is_rejected(self):
-        for devices in [[], [{"serial": "phone"}, {"serial": "phone"}]]:
-            with patch.object(self.bridge, "_devices", return_value=devices):
-                with self.assertRaises(ValueError):
-                    self.bridge.shell("phone", "id")
+        other = {"serial": "other", "port_path": [1, 3]}
+        for devices, message in [
+            ([other], "No connected USB phone has the serial 'phone'.*'other'"),
+            ([{"serial": "phone"}, {"serial": "phone"}], "2 connected USB phones"),
+        ]:
+            with (
+                patch.object(self.bridge, "_devices", return_value=devices),
+                patch.object(bridge.time, "sleep"),
+                self.assertRaisesRegex(bridge.DeviceNotFoundError, message),
+            ):
+                self.bridge.shell("phone", "id")
         self.usb.assert_not_called()
+
+    def test_phone_is_found_again_after_a_transient_identity_failure(self):
+        self.usb.return_value.shell.return_value = b"Pixel\n"
+        unreadable = Mock(port_path=[1, 2])
+        type(unreadable).serial_number = PropertyMock(side_effect=OSError("busy"))
+        readable = Mock(serial_number="phone", port_path=[1, 2])
+        with (
+            patch.object(self.bridge.usb_transport, "find_all_adb_devices") as found,
+            patch.object(bridge.time, "sleep") as sleep,
+        ):
+            found.side_effect = [[unreadable], [], [readable]]
+            self.assertEqual(self.bridge.shell("phone", "id"), "Pixel\n")
+            self.assertEqual(sleep.call_count, 2)
+            # A lasting failure names its cause instead of blaming the serial.
+            found.side_effect = None
+            found.return_value = [unreadable]
+            with self.assertRaisesRegex(
+                bridge.DeviceNotFoundError, "1 USB device.*OSError: busy"
+            ):
+                self.bridge.shell("phone", "id")
 
     def test_shell_targets_selected_device_and_closes(self):
         usb = self.usb
@@ -326,15 +353,14 @@ class BridgeTests(unittest.TestCase):
         )
         self.usb.return_value.shell.side_effect = error
         with (
-            patch.object(self.bridge, "_devices", side_effect=[
-                [PHONE], [], [], [], [], [],
-            ]),
+            patch.object(self.bridge, "_devices", side_effect=[[PHONE]] + [[]] * 15),
             patch.object(bridge.time, "sleep") as sleep,
             self.assertLogs("bridge", level="WARNING"),
             self.assertRaisesRegex(ValueError, "could not be confirmed"),
         ):
             self.bridge.shell("phone", "svc usb setFunctions none")
-        self.assertEqual(sleep.call_count, 5)
+        # Five checks, each looking for the phone three times.
+        self.assertEqual(sleep.call_count, 15)
         self.usb.return_value.shell.assert_called_once()
         self.usb.return_value.close.assert_called_once()
 
@@ -494,6 +520,30 @@ class BridgeTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "may or may not have been sent"):
             self.send(flaky(phone, "input tap", failures))
         self.assertEqual((failures, phone.taps), ([], []))
+
+        # A phone that is briefly off the bus is retried like a USB failure, and
+        # one that is absent at the tap was never asked to send.
+        phone = FakePhone()
+        absent = [1, 1]
+
+        def reenumerating(serial, command):
+            if absent:
+                absent.pop()
+                raise bridge.DeviceNotFoundError("No connected USB phone")
+            return phone(serial, command)
+
+        with self.assertLogs("bridge", level="WARNING"):
+            self.send(reenumerating)
+        self.assertEqual(phone.sent, ["Outage"])
+        phone = FakePhone()
+
+        def unplugged_at_tap(serial, command):
+            if command.startswith("input tap"):
+                raise bridge.DeviceNotFoundError("No connected USB phone")
+            return phone(serial, command)
+
+        with self.assertRaisesRegex(ValueError, "No connected.*Nothing was sent"):
+            self.send(unplugged_at_tap)
 
         # After the tap, an unreadable screen is an unconfirmed attempt, not an error.
         phone = FakePhone()

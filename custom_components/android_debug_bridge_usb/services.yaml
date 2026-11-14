@@ -7,8 +7,9 @@ shell:
   fields:
     serial:
       name: Serial
-      description: Exact USB serial from the phone's connection entity or list_devices.
-      required: true
+      description: >-
+        Exact USB serial of the phone. Leave empty to use the default phone
+        chosen in the integration's options, or the only connected phone.
       example: ABC123
       selector:
         text:
@@ -23,7 +24,8 @@ shell:
 list_devices:
   name: Discover USB phones
   description: >-
-    Refresh discovery immediately and return devices with serial and port_path.
+    Refresh discovery immediately and return devices with serial, port_path and
+    model (null until the phone has authorized USB debugging).
     Administrator access is required for user-initiated calls.
 send_sms:
   name: Attempt SMS using the phone UI
@@ -35,7 +37,9 @@ send_sms:
   fields:
     serial:
       name: Serial
-      required: true
+      description: >-
+        Exact USB serial of the phone. Leave empty to use the default phone
+        chosen in the integration's options, or the only connected phone.
       selector:
         text:
     recipient:

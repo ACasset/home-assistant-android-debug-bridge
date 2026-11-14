@@ -55,6 +55,9 @@ class PhoneEntity(CoordinatorEntity[UsbCoordinator], BinarySensorEntity):
             manufacturer="Android",
             serial_number=serial,
         )
+        # Only when known, so that a restart while unplugged keeps the stored model.
+        if model := coordinator.models.get(serial):
+            self._attr_device_info["model"] = model
 
 
 class UsbConnected(PhoneEntity):
